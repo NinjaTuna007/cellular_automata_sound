@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────
+# 24 kHz source in a fully-reflecting small tank
+# Domain: 3 m × 1.5 m  (300 × 150 cells, dx = dy = 0.01 m)
+# λ = c/f ≈ 1492/24000 ≈ 0.062 m ≈ 6.2 cells/wavelength
+# dt auto → ≈ 2.1 μs  → ~20 samples / cycle  (well resolved)
+# ─────────────────────────────────────────────────────────────
+
+grid:
+  nx: 300
+  ny: 150
+  dx: 0.01
+  dy: 0.01
+
+time:
+  dt: 0               # auto CFL-safe (≈2.1 μs)
+  duration: 0.02      # 20 ms — sound crosses the 3 m tank ~10 times
+
+model:
+  type: wave
+  absorption: 0.02
+
+source:
+  ix: null            # center
+  iy: null            # center
+  amplitude: 1400.0
+  frequency: 24000    # Hz
+
+boundary:
+  top:    -0.98       # surface (phase-inverting)
+  bottom:  0.99       # hard bottom
+  left:    0.99       # reflecting
+  right:   0.99       # reflecting
+
+ssp:
+  depths: [0, 0.75, 1.5]
+  speeds: [1500, 1495, 1500]   # nearly uniform — small tank
+
+backend: auto
+
+output:
+  frame_stride: 20
+  gif_fps: 30
+  tag: 24khz_all_reflect

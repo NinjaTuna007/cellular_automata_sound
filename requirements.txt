@@ -1,0 +1,16 @@
+# Core numerical + visualization stack
+numpy
+matplotlib
+pillow
+pyyaml
+
+# Interactive real-time GUI viewer.
+pygame
+
+# High-performance backends (optional but recommended).
+# Numba: JIT-compiled parallel CPU loops across all cores.
+numba
+
+# CuPy: fused CUDA kernels on NVIDIA GPU.
+# Pick the wheel matching your CUDA toolkit version.
+cupy-cuda12x

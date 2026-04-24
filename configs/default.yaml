@@ -1,0 +1,74 @@
+# ─────────────────────────────────────────────────────────────
+# Default experiment configuration
+# Copy this file, tweak what you need, run with:
+#   python scripts/run_experiment.py --config configs/my_expt.yaml
+# ─────────────────────────────────────────────────────────────
+
+# ── Grid geometry ───────────────────────────────────────────
+grid:
+  nx: 160           # cells in x
+  ny: 90            # cells in y
+  dx: 1.0           # cell width  (m)
+  dy: 1.0           # cell height (m)
+
+# ── Time stepping ──────────────────────────────────────────
+time:
+  dt: 0             # time step (s). 0 → auto CFL-safe value
+  steps: 1800       # ignored when duration > 0
+  duration: 0       # total sim time (s). 0 → use steps instead
+
+# ── Propagation model ──────────────────────────────────────
+model:
+  type: wave        # "wave" (recommended) or "transfer" (legacy)
+  absorption: 0.05  # wave absorption per second
+
+# ── Source ─────────────────────────────────────────────────
+source:
+  ix: null          # x-index, null → center of grid
+  iy: null          # y-index, null → center of grid
+  amplitude: 1400.0 # Pa
+  frequency: 200    # Hz — keep below c_min/(5*dx) for spatial resolution
+
+# ── Boundary reflections ──────────────────────────────────
+# Range: -1.0 (full phase-inverting) to 1.0 (full reflecting)
+# 0.0 = fully open / non-reflective
+boundary:
+  top:    -0.98     # surface (phase-inverting by default)
+  bottom:  0.99     # seabed
+  left:    0.99
+  right:   0.99
+
+  # Optional open segments as "start:end" index ranges.
+  # Energy leaves the domain through these segments.
+  # Example: ["40:90", "120:160"]
+  top_open_x:    []
+  bottom_open_x: []
+  left_open_y:   []
+  right_open_y:  []
+
+# ── Sound speed profile ───────────────────────────────────
+# Pairs of (depth_m, speed_m/s), linearly interpolated onto grid.
+ssp:
+  depths: [0, 15, 35, 60, 90]
+  speeds: [1535, 1518, 1492, 1503, 1520]
+
+# ── Legacy transfer model params (only used when model.type = transfer)
+transfer:
+  fraction: 0.42
+  damping: 0.002
+  diagonal_interface_scale: 0.35
+  overpressure_only: false
+  refraction_strength: 0.45
+  use_impedance_interface: true
+
+# ── Execution ─────────────────────────────────────────────
+backend: auto       # "auto", "cpu", "gpu"
+use_float32: true
+
+# ── Output ────────────────────────────────────────────────
+output:
+  frame_stride: 2
+  gif_fps: 25
+  no_gif: false
+  no_grid: false    # set true to hide cell boundary grid lines
+  tag: ""           # extra label appended to experiment directory name

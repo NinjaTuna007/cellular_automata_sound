@@ -1,0 +1,37 @@
+---
+description: Python coding conventions for the CA simulator
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Python Conventions
+
+## Style
+
+- Use `from __future__ import annotations` for modern type hints
+- Prefer dataclasses for configuration (`PressureCASimConfig`)
+- Type-annotate function signatures with `Dict`, `List`, `Tuple` from `typing`
+- NumPy-vectorized array operations -- never per-cell Python loops in hot paths
+- Private helpers prefixed with `_`
+
+## Numerical code patterns
+
+- Always respect `_sim_dtype(cfg)` for consistent float32/float64 across arrays
+- CuPy code mirrors NumPy structure; use `cp.asarray` / `cp.asnumpy` at boundaries
+- Precompute invariant tables before the time-stepping loop
+- CFL check before wave simulation: `cmax * dt * sqrt(1/dx^2 + 1/dy^2) < 1`
+- Boundary conditions applied after interior update each step
+
+## Backend fallback pattern
+
+```python
+if requested in ("auto", "gpu"):
+    try:
+        result = _run_gpu_variant(...)
+        return result
+    except Exception:
+        if requested == "gpu":
+            raise
+result = _run_cpu_variant(...)
+return result
+```

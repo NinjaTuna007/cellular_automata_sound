@@ -1,0 +1,47 @@
+---
+description: Project overview and structure for the underwater acoustics CA simulator
+alwaysApply: true
+---
+
+# Pressure Transfer Cellular Automaton
+
+2D CA simulator for underwater acoustic pressure propagation (SMaRC PhD project).
+
+## Directory Layout
+
+```
+src/                    # Core engine (importable module)
+  pressure_transfer_ca.py
+scripts/                # Runnable entry points
+  run_experiment.py     # Config-driven runner → per-experiment dirs
+  benchmark_backends.py
+configs/                # YAML config files (one per experiment setup)
+  default.yaml          # Fully documented template
+experiments/            # Output: one timestamped subdirectory per run
+  <name>/config.yaml    # Cloned config for reproducibility
+  <name>/summary.png
+  <name>/propagation.gif
+```
+
+## Config-driven experiments
+
+All parameters live in YAML config files under `configs/`. The runner clones the config into the experiment output directory so results are self-contained.
+
+```bash
+python scripts/run_experiment.py --config configs/my_expt.yaml
+python scripts/run_experiment.py --config configs/my_expt.yaml --steps 100 --no-gif  # CLI overrides
+```
+
+## Import pattern
+
+Scripts in `scripts/` add `src/` to sys.path:
+```python
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from pressure_transfer_ca import PressureCASimConfig, run_pressure_transfer_ca
+```
+
+## Key physics
+
+- Wave model: `c(y)^2 * Laplacian(p)` with CFL check, boundary reflections, absorption
+- Transfer model: legacy CA with impedance interface, refraction, precomputed tables
+- SSP interpolated onto grid, supports rectangular cells (dx != dy)
