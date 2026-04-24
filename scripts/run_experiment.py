@@ -1,15 +1,36 @@
 #!/usr/bin/env python3
-"""Run a pressure-transfer CA experiment from a YAML config file.
+"""Batch experiment runner for the underwater sound simulator.
 
-Workflow:
-  1. Copy configs/default.yaml → configs/my_experiment.yaml
-  2. Edit the copy to set your parameters
-  3. python scripts/run_experiment.py --config configs/my_experiment.yaml
+Runs a full simulation from a YAML config file, then saves all output
+into a timestamped directory under ``experiments/``.
 
-The config file is cloned verbatim into the experiment output directory
-so every result is fully reproducible from its own folder.
+Workflow
+-------
+::
 
-CLI flags override config values for quick one-off tweaks.
+    cp configs/default.yaml configs/my_experiment.yaml
+    # edit my_experiment.yaml
+    python scripts/run_experiment.py --config configs/my_experiment.yaml
+
+What you get in the output directory:
+
+- ``config.yaml`` — exact clone of the config used (so you can always
+  reproduce the run from its own folder, even years later)
+- ``summary.png`` — four-panel plot: hydrostatic pressure, sound speed
+  profile, final acoustic field, source waveform
+- ``propagation.gif`` — animated wave propagation (skip with ``--no-gif``)
+
+CLI flags override config values for quick one-off tweaks without
+editing the file (priority: CLI > config > built-in defaults).
+
+Examples
+--------
+::
+
+    python scripts/run_experiment.py                          # default config
+    python scripts/run_experiment.py --steps 100 --no-gif     # quick smoke test
+    python scripts/run_experiment.py --freq-hz 1000           # change frequency
+    python scripts/run_experiment.py --reflect-left 0.0       # open one wall
 """
 from __future__ import annotations
 
@@ -30,6 +51,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from pressure_transfer_ca import (
     PressureCASimConfig,
+    auto_resolve_grid,
     plot_static_and_final,
     run_pressure_transfer_ca,
     save_gif_parallel,
@@ -117,14 +139,27 @@ def parse_range_list(raw) -> tuple:
 def config_to_sim(cfg: dict, args) -> PressureCASimConfig:
     """Build PressureCASimConfig from YAML dict + CLI overrides."""
 
-    nx = args.nx or get(cfg, "grid", "nx", default=160)
-    ny = args.ny or get(cfg, "grid", "ny", default=90)
-    dx = args.dx or get(cfg, "grid", "dx", default=1.0)
-    dy = args.dy or get(cfg, "grid", "dy", default=1.0)
+    ssp_depths = tuple(get(cfg, "ssp", "depths", default=[0, 15, 35, 60, 90]))
+    ssp_speeds = tuple(get(cfg, "ssp", "speeds", default=[1535, 1518, 1492, 1503, 1520]))
+    freq = args.freq_hz if args.freq_hz is not None else get(cfg, "source", "frequency", default=24000)
 
-    dt_raw = args.dt if args.dt is not None else get(cfg, "time", "dt", default=0)
+    grid = auto_resolve_grid(
+        frequency_hz=freq,
+        c_min=min(ssp_speeds),
+        c_max=max(ssp_speeds),
+        width_m=get(cfg, "grid", "width_m", default=None),
+        height_m=get(cfg, "grid", "height_m", default=None),
+        dx=args.dx or get(cfg, "grid", "dx", default=0),
+        dy=args.dy or get(cfg, "grid", "dy", default=0),
+        dt=args.dt if args.dt is not None else get(cfg, "time", "dt", default=0),
+        nx=args.nx or get(cfg, "grid", "nx", default=0),
+        ny=args.ny or get(cfg, "grid", "ny", default=0),
+        cells_per_wavelength=get(cfg, "grid", "cells_per_wavelength", default=10),
+    )
+    nx, ny = grid["nx"], grid["ny"]
+    dx, dy, dt = grid["dx"], grid["dy"], grid["dt"]
+
     steps_raw = args.steps if args.steps is not None else get(cfg, "time", "steps", default=1800)
-    # CLI --steps should beat config duration; CLI --duration beats everything.
     steps_explicit_cli = args.steps is not None
     if args.duration is not None:
         duration = args.duration
@@ -132,6 +167,11 @@ def config_to_sim(cfg: dict, args) -> PressureCASimConfig:
         duration = 0
     else:
         duration = get(cfg, "time", "duration", default=0)
+
+    if duration and duration > 0:
+        steps = max(1, int(round(duration / dt)))
+    else:
+        steps = steps_raw
 
     model = args.model or get(cfg, "model", "type", default="wave")
     absorption = args.absorption if args.absorption is not None else get(cfg, "model", "absorption", default=0.05)
@@ -141,24 +181,11 @@ def config_to_sim(cfg: dict, args) -> PressureCASimConfig:
     source_ix = source_ix_raw if source_ix_raw is not None else nx // 2
     source_iy = source_iy_raw if source_iy_raw is not None else ny // 2
     amplitude = args.source_amplitude if args.source_amplitude is not None else get(cfg, "source", "amplitude", default=1400.0)
-    freq = args.freq_hz if args.freq_hz is not None else get(cfg, "source", "frequency", default=24000)
 
     r_top = args.reflect_top if args.reflect_top is not None else get(cfg, "boundary", "top", default=-0.98)
     r_bot = args.reflect_bottom if args.reflect_bottom is not None else get(cfg, "boundary", "bottom", default=0.99)
     r_lft = args.reflect_left if args.reflect_left is not None else get(cfg, "boundary", "left", default=0.99)
     r_rgt = args.reflect_right if args.reflect_right is not None else get(cfg, "boundary", "right", default=0.99)
-
-    ssp_depths = tuple(get(cfg, "ssp", "depths", default=[0, 15, 35, 60, 90]))
-    ssp_speeds = tuple(get(cfg, "ssp", "speeds", default=[1535, 1518, 1492, 1503, 1520]))
-    cmax = max(ssp_speeds)
-
-    dt_auto = 0.45 / (cmax * ((1.0 / (dx ** 2) + 1.0 / (dy ** 2)) ** 0.5))
-    dt = dt_raw if dt_raw and dt_raw > 0 else dt_auto
-
-    if duration and duration > 0:
-        steps = max(1, int(round(duration / dt)))
-    else:
-        steps = steps_raw
 
     backend = args.backend or get(cfg, "backend", default="auto")
     use_float32 = get(cfg, "use_float32", default=True)

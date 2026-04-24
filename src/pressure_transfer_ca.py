@@ -1,3 +1,30 @@
+"""2D acoustic pressure propagation engine using cellular automata / finite differences.
+
+This module is the core of the underwater sound simulator.  It solves the
+second-order wave equation on a uniform 2D grid with a depth-varying sound
+speed profile (SSP), configurable boundary reflections, and a sinusoidal
+pressure source.
+
+Three compute backends are supported (selected automatically):
+
+1. **GPU** — fused CUDA kernels via CuPy (fastest, needs NVIDIA GPU)
+2. **CPU-Numba** — JIT-compiled parallel loops (fast, needs Numba)
+3. **CPU-NumPy** — pure vectorised NumPy (always available)
+
+The two main entry points are:
+
+- ``WaveStepper`` — stateful, one-step-at-a-time interface for the GUI.
+  Supports batched ``step_n()`` to keep the GPU busy.
+- ``run_pressure_transfer_ca()`` — one-shot batch run that returns the
+  full frame history, source trace, and final field.
+
+Both are configured via ``PressureCASimConfig``, a dataclass that holds
+every knob.  Use ``auto_resolve_grid()`` to compute grid sizes and timestep
+from the source frequency so you never have to worry about aliasing.
+
+Plotting helpers (``plot_static_and_final``, ``save_gif_parallel``) are
+included so experiments produce self-contained visual output.
+"""
 from __future__ import annotations
 
 import os
@@ -30,6 +57,16 @@ except (ImportError, AttributeError):
 
 @dataclass
 class PressureCASimConfig:
+    """Every parameter the simulator needs, in one place.
+
+    Grid geometry, time stepping, physics (SSP, boundaries, absorption),
+    source definition, and execution options.  Typically built by
+    ``config_to_sim()`` from a YAML file, not constructed by hand.
+
+    Set ``dx``, ``dy``, ``dt`` to 0 and call ``auto_resolve_grid()``
+    to have them computed from the source frequency automatically.
+    """
+
     # Grid resolution (number of cells)
     nx: int = 120
     ny: int = 80
@@ -172,12 +209,19 @@ def _shift_add_inplace(out, src, ox: int, oy: int):
 
 
 def build_static_pressure(cfg: PressureCASimConfig) -> np.ndarray:
+    """Hydrostatic pressure field p = ρgh for each row (depth increases with y)."""
     depth_centers = (np.arange(cfg.ny) + 0.5) * cfg.dy
     static_by_row = cfg.rho * cfg.g * depth_centers
     return np.repeat(static_by_row[:, None], cfg.nx, axis=1)
 
 
 def build_sound_speed_grid(cfg: PressureCASimConfig) -> np.ndarray:
+    """Interpolate the SSP depth/speed pairs onto a (ny, nx) grid.
+
+    Each row gets one speed value (linearly interpolated from the SSP
+    table).  The result is broadcast across columns since the SSP
+    varies only with depth.
+    """
     if len(cfg.ssp_depths_m) != len(cfg.ssp_speeds_mps):
         raise ValueError("ssp_depths_m and ssp_speeds_mps must have same length.")
     if len(cfg.ssp_depths_m) < 2:
@@ -421,6 +465,59 @@ def _check_wave_cfl(cfg: PressureCASimConfig, sound_speed: np.ndarray):
             )
 
 
+def auto_resolve_grid(
+    frequency_hz: float,
+    c_min: float = 1490.0,
+    c_max: float = 1540.0,
+    width_m: float | None = None,
+    height_m: float | None = None,
+    dx: float = 0.0,
+    dy: float = 0.0,
+    dt: float = 0.0,
+    nx: int = 0,
+    ny: int = 0,
+    cells_per_wavelength: int = 10,
+    cfl_factor: float = 0.45,
+) -> dict:
+    """Compute grid/time parameters that avoid aliasing for a given frequency.
+
+    Any parameter left at 0 (or None for sizes) is auto-computed.
+    Explicitly provided non-zero values are kept as-is.
+
+    Returns dict with keys: dx, dy, dt, nx, ny, width_m, height_m.
+    """
+    wl_min = c_min / max(frequency_hz, 1e-6)
+
+    if dx <= 0:
+        dx = wl_min / cells_per_wavelength
+    if dy <= 0:
+        dy = dx
+
+    if dt <= 0:
+        dt = cfl_factor / (c_max * ((1.0 / dx**2 + 1.0 / dy**2) ** 0.5))
+
+    if width_m is not None and width_m > 0:
+        if nx <= 0:
+            nx = max(4, int(np.ceil(width_m / dx)))
+    elif nx > 0:
+        width_m = nx * dx
+    else:
+        nx = 160
+        width_m = nx * dx
+
+    if height_m is not None and height_m > 0:
+        if ny <= 0:
+            ny = max(4, int(np.ceil(height_m / dy)))
+    elif ny > 0:
+        height_m = ny * dy
+    else:
+        ny = 90
+        height_m = ny * dy
+
+    return dict(dx=dx, dy=dy, dt=dt, nx=nx, ny=ny,
+                width_m=width_m, height_m=height_m)
+
+
 def _apply_open_ranges_1d(values: np.ndarray, ranges: Tuple[Tuple[int, int], ...]):
     n = values.shape[0]
     for start, end in ranges:
@@ -659,6 +756,49 @@ void wave_step_f64(
 }
 '''
 
+# Boundary + source kernel: applied AFTER the interior update kernel.
+# Runs on boundary cells only (max 2*(nx+ny) threads) -- very lightweight.
+_WAVE_BOUNDARY_CUDA_TEMPLATE = r'''
+extern "C" __global__
+void wave_boundary_{T}(
+    {F}* __restrict__ p_next,
+    const int ny, const int nx,
+    const {F}* __restrict__ top_r,
+    const {F}* __restrict__ bot_r,
+    const {F}* __restrict__ left_r,
+    const {F}* __restrict__ right_r,
+    const int src_iy, const int src_ix,
+    const {F} src_val
+) {{
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int perimeter = 2 * nx + 2 * (ny - 2);
+    if (idx >= perimeter) return;
+
+    if (idx < nx) {{
+        // Top row: boundary cell (0, i) = top_r[i] * p_next(1, i)
+        int i = idx;
+        p_next[i] = top_r[i] * p_next[nx + i];
+    }} else if (idx < 2 * nx) {{
+        // Bottom row
+        int i = idx - nx;
+        p_next[(ny - 1) * nx + i] = bot_r[i] * p_next[(ny - 2) * nx + i];
+    }} else if (idx < 2 * nx + (ny - 2)) {{
+        // Left col (excluding corners)
+        int j = idx - 2 * nx + 1;
+        p_next[j * nx] = left_r[j] * p_next[j * nx + 1];
+    }} else {{
+        // Right col (excluding corners)
+        int j = idx - 2 * nx - (ny - 2) + 1;
+        p_next[j * nx + nx - 1] = right_r[j] * p_next[j * nx + nx - 2];
+    }}
+
+    // Source injection (only one thread matches)
+    if (idx == 0) {{
+        p_next[src_iy * nx + src_ix] += src_val;
+    }}
+}}
+'''
+
 _cuda_kernels: dict = {}
 
 
@@ -669,6 +809,16 @@ def _get_cuda_wave_kernel(use_float32: bool):
             _cuda_kernels[key] = cp.RawKernel(_WAVE_CUDA_SRC_F32, "wave_step_f32")
         else:
             _cuda_kernels[key] = cp.RawKernel(_WAVE_CUDA_SRC_F64, "wave_step_f64")
+    return _cuda_kernels[key]
+
+
+def _get_cuda_boundary_kernel(use_float32: bool):
+    key = "bnd_f32" if use_float32 else "bnd_f64"
+    if key not in _cuda_kernels:
+        T = "f32" if use_float32 else "f64"
+        F = "float" if use_float32 else "double"
+        src = _WAVE_BOUNDARY_CUDA_TEMPLATE.format(T=T, F=F)
+        _cuda_kernels[key] = cp.RawKernel(src, f"wave_boundary_{T}")
     return _cuda_kernels[key]
 
 
@@ -903,6 +1053,7 @@ class WaveStepper:
         dt_cp = cp.float32 if dt_np == np.float32 else cp.float64
         self._dt_cp = dt_cp
         self._gpu_kernel = _get_cuda_wave_kernel(self.cfg.use_float32)
+        self._gpu_bnd_kernel = _get_cuda_boundary_kernel(self.cfg.use_float32)
         ny, nx = self.cfg.ny, self.cfg.nx
         self._gpu_p_prev = cp.zeros((ny, nx), dtype=dt_cp)
         self._gpu_p = cp.zeros((ny, nx), dtype=dt_cp)
@@ -918,6 +1069,9 @@ class WaveStepper:
         total = ny * nx
         self._gpu_block = 256
         self._gpu_grid = (total + self._gpu_block - 1) // self._gpu_block
+        perimeter = 2 * nx + 2 * (ny - 2)
+        self._gpu_bnd_block = min(256, perimeter)
+        self._gpu_bnd_grid = (perimeter + self._gpu_bnd_block - 1) // self._gpu_bnd_block
         self._gpu_top_r = cp.asarray(bnd["top"], dtype=dt_cp)
         self._gpu_bot_r = cp.asarray(bnd["bottom"], dtype=dt_cp)
         self._gpu_left_r = cp.asarray(bnd["left"], dtype=dt_cp)
@@ -973,6 +1127,7 @@ class WaveStepper:
     def _step_gpu(self):
         cfg = self.cfg
         t = self._step_count * cfg.dt
+        src_val = _source_extra_value(cfg, t)
 
         self._gpu_kernel(
             (self._gpu_grid,), (self._gpu_block,),
@@ -980,25 +1135,169 @@ class WaveStepper:
              self._gpu_ny, self._gpu_nx,
              self._gpu_inv_dx2, self._gpu_inv_dy2,
              self._gpu_two_m_s, self._gpu_one_m_s))
-
-        pn = self._gpu_p_next
-        pn[0, :] = self._gpu_top_r * pn[1, :]
-        pn[-1, :] = self._gpu_bot_r * pn[-2, :]
-        pn[:, 0] = self._gpu_left_r * pn[:, 1]
-        pn[:, -1] = self._gpu_right_r * pn[:, -2]
-
-        src_val = _source_extra_value(cfg, t)
-        pn[cfg.source_iy, cfg.source_ix] += self._dt_cp(src_val)
+        self._gpu_bnd_kernel(
+            (self._gpu_bnd_grid,), (self._gpu_bnd_block,),
+            (self._gpu_p_next,
+             self._gpu_ny, self._gpu_nx,
+             self._gpu_top_r, self._gpu_bot_r,
+             self._gpu_left_r, self._gpu_right_r,
+             np.int32(cfg.source_iy), np.int32(cfg.source_ix),
+             self._dt_cp(src_val)))
 
         self._gpu_p_prev, self._gpu_p, self._gpu_p_next = (
             self._gpu_p, self._gpu_p_next, self._gpu_p_prev)
         return float(src_val)
 
     def step(self) -> np.ndarray:
-        """Advance one timestep. Returns current pressure field (numpy, shape ny x nx)."""
+        """Advance one timestep. Returns current pressure field (numpy)."""
         self._step_fn()
         self._step_count += 1
         return self.pressure
+
+    def step_n(self, n: int,
+               probe_cells: list[tuple[int, int]] | None = None,
+               probe_stride: int = 1,
+               ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+        """Advance *n* timesteps in a tight loop, minimizing GPU→CPU transfers.
+
+        Parameters
+        ----------
+        n : int
+            Number of timesteps to advance.
+        probe_cells : list of (ix, iy) or None
+            Grid cells to record pressure at.
+        probe_stride : int
+            Sample probes every *probe_stride* steps (default 1 = every step).
+
+        Returns
+        -------
+        field : np.ndarray (ny, nx)
+            Pressure field after the last step.
+        probe_values : np.ndarray (n_samples, n_probes) float64 or None
+            Pressure at each probe cell at sampled steps.
+        probe_times : np.ndarray (n_samples,) float64 or None
+            Simulation time at each sampled step.
+        """
+        cfg = self.cfg
+        n_probes = len(probe_cells) if probe_cells else 0
+        probe_stride = max(1, probe_stride)
+
+        if n_probes:
+            n_samples = (n + probe_stride - 1) // probe_stride
+            probe_vals = np.empty((n_samples, n_probes), dtype=np.float64)
+            probe_ts = np.empty(n_samples, dtype=np.float64)
+        else:
+            n_samples = 0
+            probe_vals = None
+            probe_ts = None
+
+        if self._use_gpu:
+            self._step_n_gpu(n, probe_cells, probe_vals, probe_ts, probe_stride)
+        elif hasattr(self, "_nb_kernel"):
+            self._step_n_numba(n, probe_cells, probe_vals, probe_ts, probe_stride)
+        else:
+            self._step_n_numpy(n, probe_cells, probe_vals, probe_ts, probe_stride)
+
+        return self.pressure, probe_vals, probe_ts
+
+    def _step_n_gpu(self, n, probe_cells, probe_vals, probe_ts, stride):
+        cfg = self.cfg
+        interior_kernel = self._gpu_kernel
+        bnd_kernel = self._gpu_bnd_kernel
+        igrid, iblock = (self._gpu_grid,), (self._gpu_block,)
+        bgrid, bblock = (self._gpu_bnd_grid,), (self._gpu_bnd_block,)
+        top_r, bot_r = self._gpu_top_r, self._gpu_bot_r
+        left_r, right_r = self._gpu_left_r, self._gpu_right_r
+        dt_cast = self._dt_cp
+        p, pp, pn = self._gpu_p, self._gpu_p_prev, self._gpu_p_next
+        c2dt2 = self._gpu_c2dt2
+        gny, gnx = self._gpu_ny, self._gpu_nx
+        inv_dx2, inv_dy2 = self._gpu_inv_dx2, self._gpu_inv_dy2
+        two_m_s, one_m_s = self._gpu_two_m_s, self._gpu_one_m_s
+        src_iy = np.int32(cfg.source_iy)
+        src_ix = np.int32(cfg.source_ix)
+        has_probes = probe_vals is not None
+
+        # Pre-compute ALL source values on CPU in one vectorized call
+        step_indices = np.arange(self._step_count, self._step_count + n)
+        t_arr = step_indices * cfg.dt
+        src_all = cfg.source_amplitude_pa * np.sin(
+            2.0 * np.pi * cfg.source_frequency_hz * t_arr + cfg.source_phase_rad)
+        if cfg.overpressure_only:
+            np.maximum(src_all, 0.0, out=src_all)
+
+        if has_probes:
+            iy_arr = cp.array([iy for ix, iy in probe_cells], dtype=cp.int64)
+            ix_arr = cp.array([ix for ix, iy in probe_cells], dtype=cp.int64)
+            n_samples = probe_vals.shape[0]
+            gpu_probe_buf = cp.empty((n_samples, len(probe_cells)), dtype=cp.float64)
+
+        sample_idx = 0
+        for i in range(n):
+            src_val = dt_cast(float(src_all[i]))
+
+            interior_kernel(igrid, iblock,
+                            (p, pp, c2dt2, pn,
+                             gny, gnx, inv_dx2, inv_dy2,
+                             two_m_s, one_m_s))
+            bnd_kernel(bgrid, bblock,
+                       (pn, gny, gnx,
+                        top_r, bot_r, left_r, right_r,
+                        src_iy, src_ix, src_val))
+
+            pp, p, pn = p, pn, pp
+            self._step_count += 1
+
+            if has_probes and (i % stride == stride - 1 or i == n - 1):
+                gpu_probe_buf[sample_idx, :] = p[iy_arr, ix_arr]
+                sample_idx += 1
+
+        self._gpu_p_prev, self._gpu_p, self._gpu_p_next = pp, p, pn
+        cp.cuda.Stream.null.synchronize()
+
+        if has_probes:
+            probe_vals[:sample_idx] = cp.asnumpy(gpu_probe_buf[:sample_idx])
+            dt_val = cfg.dt
+            base_step = self._step_count - n
+            si = 0
+            for i in range(n):
+                if i % stride == stride - 1 or i == n - 1:
+                    probe_ts[si] = (base_step + i + 1) * dt_val
+                    si += 1
+
+    def _step_n_numba(self, n, probe_cells, probe_vals, probe_ts, stride):
+        cfg = self.cfg
+        kernel = self._nb_kernel
+        has_probes = probe_vals is not None
+        sample_idx = 0
+        for i in range(n):
+            t = self._step_count * cfg.dt
+            kernel(self._p, self._p_prev, self._p_next_buf,
+                   self._c2dt2, self._inv_dx2, self._inv_dy2, self._sigma_dt,
+                   self._top_r, self._bot_r, self._left_r, self._right_r)
+            src_val = self._dtype(_source_extra_value(cfg, t))
+            self._p_next_buf[cfg.source_iy, cfg.source_ix] += src_val
+            self._p_prev, self._p, self._p_next_buf = (
+                self._p, self._p_next_buf, self._p_prev)
+            self._step_count += 1
+            if has_probes and (i % stride == stride - 1 or i == n - 1):
+                probe_ts[sample_idx] = self._step_count * cfg.dt
+                for j, (ix, iy) in enumerate(probe_cells):
+                    probe_vals[sample_idx, j] = self._p[iy, ix]
+                sample_idx += 1
+
+    def _step_n_numpy(self, n, probe_cells, probe_vals, probe_ts, stride):
+        cfg = self.cfg
+        has_probes = probe_vals is not None
+        sample_idx = 0
+        for i in range(n):
+            self._step_numpy()
+            self._step_count += 1
+            if has_probes and (i % stride == stride - 1 or i == n - 1):
+                probe_ts[sample_idx] = self._step_count * cfg.dt
+                for j, (ix, iy) in enumerate(probe_cells):
+                    probe_vals[sample_idx, j] = self._p[iy, ix]
+                sample_idx += 1
 
     @property
     def pressure(self) -> np.ndarray:
@@ -1034,6 +1333,17 @@ class WaveStepper:
 
 
 def run_pressure_transfer_ca(cfg: PressureCASimConfig):
+    """Run the full simulation and return results as a dict.
+
+    This is the batch entry point used by ``run_experiment.py``.
+    It runs all ``cfg.steps`` timesteps, collects sampled frames,
+    and returns everything needed for plotting and GIF generation.
+
+    Returns a dict with keys:
+        backend_used, static_pressure, sound_speed,
+        final_extra_pressure, final_total_pressure,
+        frames_extra, source_trace_extra.
+    """
     if cfg.nx <= 2 or cfg.ny <= 2:
         raise ValueError("Grid must be at least 3x3.")
     if not (0.0 <= cfg.transfer_fraction <= 1.0):
@@ -1137,6 +1447,12 @@ def _apply_cell_grid(ax, cfg: PressureCASimConfig, color: str = "k", alpha: floa
 
 
 def plot_static_and_final(result, show_grid: bool = True):
+    """Create a four-panel summary figure from simulation results.
+
+    Panels: (1) hydrostatic pressure, (2) sound speed profile,
+    (3) final acoustic pressure field, (4) source waveform.
+    Returns the matplotlib Figure for saving.
+    """
     cfg: PressureCASimConfig = result["cfg"]
     static_pressure = result["static_pressure"]
     sound_speed = result["sound_speed"]
@@ -1184,6 +1500,7 @@ def plot_static_and_final(result, show_grid: bool = True):
 
 def animate_extra_pressure(result, fps: int = 24, show_time: bool = True,
                            show_grid: bool = True):
+    """Create a matplotlib Animation of the acoustic pressure propagation."""
     cfg: PressureCASimConfig = result["cfg"]
     frames = result["frames_extra"]
 

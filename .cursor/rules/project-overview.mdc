@@ -3,45 +3,70 @@ description: Project overview and structure for the underwater acoustics CA simu
 alwaysApply: true
 ---
 
-# Pressure Transfer Cellular Automaton
+# Underwater Sound Propagation Simulator
 
-2D CA simulator for underwater acoustic pressure propagation (SMaRC PhD project).
+2D cellular automaton / finite-difference solver for underwater acoustic
+pressure propagation with depth-varying sound speed (SMaRC PhD project).
 
 ## Directory Layout
 
 ```
-src/                    # Core engine (importable module)
-  pressure_transfer_ca.py
-scripts/                # Runnable entry points
-  run_experiment.py     # Config-driven runner → per-experiment dirs
-  benchmark_backends.py
-configs/                # YAML config files (one per experiment setup)
-  default.yaml          # Fully documented template
-experiments/            # Output: one timestamped subdirectory per run
-  <name>/config.yaml    # Cloned config for reproducibility
-  <name>/summary.png
-  <name>/propagation.gif
+src/
+  pressure_transfer_ca.py     # THE engine: config, physics, GPU kernels, plotting
+scripts/
+  gui.py                      # Real-time Pygame viewer with click-to-probe
+  run_experiment.py            # Batch runner → timestamped experiment dirs
+  benchmark_backends.py        # CPU vs GPU timing
+  sweep.py                     # Parameter sweep helper
+configs/
+  default.yaml                 # Fully documented template — start here
+  no_side_reflection.yaml      # Open left/right edges
+  24khz_all_reflect.yaml       # 24 kHz small-tank config
+experiments/                   # Output (git-ignored), one folder per run
+  <timestamp>_<params>/
+    config.yaml                # Cloned for reproducibility
+    summary.png
+    propagation.gif
 ```
+
+## Key architecture
+
+- **`PressureCASimConfig`** — dataclass with every sim parameter.
+- **`auto_resolve_grid()`** — computes dx/dy/dt/nx/ny from frequency +
+  physical domain size.  Set `dx: 0` in YAML and forget about aliasing.
+- **`WaveStepper`** — stateful stepper for the GUI.  `step_n()` batches
+  N timesteps on GPU with zero intermediate transfers.
+- **`run_pressure_transfer_ca()`** — batch entry point for experiments.
+
+## Three compute backends (auto-selected)
+
+1. **GPU** — fused CUDA kernels via CuPy (interior + boundary in 2 launches)
+2. **CPU-Numba** — JIT-compiled parallel loops (all cores minus 2)
+3. **CPU-NumPy** — pure vectorised (always available)
 
 ## Config-driven experiments
 
-All parameters live in YAML config files under `configs/`. The runner clones the config into the experiment output directory so results are self-contained.
+All parameters live in YAML under `configs/`.  The runner clones config
+into the experiment dir for reproducibility.
 
 ```bash
 python scripts/run_experiment.py --config configs/my_expt.yaml
-python scripts/run_experiment.py --config configs/my_expt.yaml --steps 100 --no-gif  # CLI overrides
+python scripts/gui.py --config configs/24khz_all_reflect.yaml
 ```
 
 ## Import pattern
 
-Scripts in `scripts/` add `src/` to sys.path:
+Scripts add `src/` to sys.path:
 ```python
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from pressure_transfer_ca import PressureCASimConfig, run_pressure_transfer_ca
+from pressure_transfer_ca import PressureCASimConfig, WaveStepper, auto_resolve_grid
 ```
 
-## Key physics
+## Physics summary
 
-- Wave model: `c(y)^2 * Laplacian(p)` with CFL check, boundary reflections, absorption
-- Transfer model: legacy CA with impedance interface, refraction, precomputed tables
-- SSP interpolated onto grid, supports rectangular cells (dx != dy)
+- Second-order wave equation: `p_next = 2p − p_prev + c²dt²∇²p`
+- Depth-varying SSP interpolated onto grid
+- Boundary reflections: −1 (phase-inverting) to +1 (rigid), per-wall
+- Absorption term: exponential decay factor per second
+- CFL stability enforced: `cmax·dt·√(1/dx²+1/dy²) < 1`
+- Auto anti-aliasing: `dx = λ_min / cells_per_wavelength` (default 10)

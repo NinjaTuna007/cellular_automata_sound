@@ -2,14 +2,22 @@
 # Default experiment configuration
 # Copy this file, tweak what you need, run with:
 #   python scripts/run_experiment.py --config configs/my_expt.yaml
+#
+# ANTI-ALIASING: Set dx/dy/dt to 0 (auto) and the engine will
+# choose cell sizes and timestep that correctly resolve the
+# source frequency.  You only need to specify the physical
+# domain size (width_m / height_m) and the frequency.
 # ─────────────────────────────────────────────────────────────
 
 # ── Grid geometry ───────────────────────────────────────────
 grid:
-  nx: 160           # cells in x
-  ny: 90            # cells in y
-  dx: 1.0           # cell width  (m)
-  dy: 1.0           # cell height (m)
+  width_m: 160      # physical domain width  (m)
+  height_m: 90      # physical domain height (m)
+  dx: 0             # cell width  (m). 0 → auto from frequency
+  dy: 0             # cell height (m). 0 → auto from frequency
+  nx: 0             # cells in x. 0 → auto from width_m / dx
+  ny: 0             # cells in y. 0 → auto from height_m / dy
+  cells_per_wavelength: 10  # spatial resolution target (≥5 needed, 10 recommended)
 
 # ── Time stepping ──────────────────────────────────────────
 time:
@@ -27,7 +35,7 @@ source:
   ix: null          # x-index, null → center of grid
   iy: null          # y-index, null → center of grid
   amplitude: 1400.0 # Pa
-  frequency: 200    # Hz — keep below c_min/(5*dx) for spatial resolution
+  frequency: 200    # Hz — dx/dy/dt auto-resolve around this
 
 # ── Boundary reflections ──────────────────────────────────
 # Range: -1.0 (full phase-inverting) to 1.0 (full reflecting)

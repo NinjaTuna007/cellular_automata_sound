@@ -1,33 +1,39 @@
 # ─────────────────────────────────────────────────────────────
-# No side reflection — waves leak out left and right edges
-# 400 m wide (200 m each side of centered source), 90 m deep
+# No side reflection — waves leak out through the left and right edges
+#
+# Simulates an ocean cross-section 400 m wide (200 m on each side of a
+# centered source) and 90 m deep.  The left and right boundaries are
+# fully open (reflection = 0), so energy that reaches the sides just
+# disappears — as if the ocean extends infinitely in both directions.
+# Top and bottom still reflect (surface + seabed).
+#
+# dx/dy/dt are set to 0 → auto-resolved from the source frequency so
+# there's never any aliasing, regardless of what frequency you pick.
 # ─────────────────────────────────────────────────────────────
 
 grid:
-  nx: 400
-  ny: 90
-  dx: 1.0
-  dy: 1.0
+  width_m: 400       # 200 m on each side of the centered source
+  height_m: 90       # depth of the ocean slice
 
 time:
   dt: 0              # auto CFL-safe
-  duration: 0.5
+  duration: 0.5      # half a second of propagation
 
 model:
   type: wave
   absorption: 0.05
 
 source:
-  ix: null          # center
-  iy: null          # center
-  amplitude: 1400.0
-  frequency: 24000    # Hz — λ≈7.5m ≈ 7.5 cells/wavelength at dx=1
+  ix: null           # center of grid
+  iy: null           # center of grid
+  amplitude: 1400.0  # Pa
+  frequency: 200     # Hz — change this and dx/dy auto-adjust
 
 boundary:
-  top:    -0.98
-  bottom:  0.99
-  left:    0.99      # fully open
-  right:   0.99     # fully open
+  top:    -0.98      # surface: almost phase-inverting
+  bottom:  0.99      # seabed: almost rigid
+  left:    0.0       # fully open — waves pass through
+  right:   0.0       # fully open — waves pass through
 
 ssp:
   depths: [0, 15, 35, 60, 90]

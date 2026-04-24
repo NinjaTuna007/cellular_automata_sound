@@ -1,25 +1,59 @@
 #!/usr/bin/env python3
-"""Pygame real-time interactive viewer for the pressure-transfer CA.
+"""Real-time interactive viewer for the underwater sound simulator.
 
-Usage:
-  python scripts/gui.py --config configs/no_side_reflection.yaml
-  python scripts/gui.py --config configs/no_side_reflection.yaml --mode playback
+Opens a Pygame window that shows the pressure field as a live heatmap
+(coolwarm: blue = negative, white = zero, red = positive).  Click
+anywhere on the grid to drop a virtual hydrophone — its received
+signal appears in a combined plot panel on the right, overlaid with
+the analytical source waveform for comparison.
 
-Controls:
+Usage
+-----
+::
+
+    python scripts/gui.py                                        # default config
+    python scripts/gui.py --config configs/24khz_all_reflect.yaml
+    python scripts/gui.py --config configs/default.yaml --mode playback
+
+Modes
+-----
+- **live** (default): simulation runs on-the-fly.  Press ``+`` to
+  increase steps-per-frame and keep the GPU busy.
+- **playback**: pre-computes all frames, then lets you scrub/rewind
+  like a video.
+
+Controls
+--------
   Space        Play / pause
   Right arrow  Step forward (when paused)
   Left arrow   Step backward (playback mode, when paused)
   R            Reset to step 0
-  +/=          More steps per frame (faster)
-  -            Fewer steps per frame (slower)
-  Click grid   Open probe (pressure time-series vs source)
-  Right-click  Remove probe under cursor (on grid marker or panel)
+  +/=          Increase simulation speed
+  -            Decrease simulation speed
+  Click grid   Place a probe (pressure time-series)
+  Right-click  Remove probe under cursor
+  Click legend Remove that probe's plot
   Esc / Q      Quit
+
+Architecture
+------------
+- **Main loop**: Pygame event handling → ``stepper.step_n()`` (batched
+  GPU timesteps) → colour-map field to surface → blit → HUD.
+- **Probes**: ``Probe`` objects accumulate ``(time, pressure)``.
+  A ``_ProbePlotRenderer`` runs Matplotlib in a background thread so
+  plot rendering never blocks the UI.
+- **Layout**: grid left, probe panel right, HUD bar bottom.
+  Dynamically recalculated on window resize (``VIDEORESIZE``).
+- **Performance**: ``step_n()`` keeps the GPU busy for N steps with
+  zero intermediate GPU→CPU transfers.  Probe values are subsampled
+  (``probe_stride``) to avoid per-step GPU round-trips.
 """
 from __future__ import annotations
 
 import argparse
 import sys
+import threading
+import time as _time
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +72,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from pressure_transfer_ca import (
     PressureCASimConfig,
     WaveStepper,
+    auto_resolve_grid,
 )
 
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "default.yaml"
@@ -74,22 +109,28 @@ def _parse_range_list(raw) -> tuple:
 
 
 def config_to_sim(cfg: dict) -> PressureCASimConfig:
-    nx = _get(cfg, "grid", "nx", default=160)
-    ny = _get(cfg, "grid", "ny", default=90)
-    dx = _get(cfg, "grid", "dx", default=1.0)
-    dy = _get(cfg, "grid", "dy", default=1.0)
-
-    dt_raw = _get(cfg, "time", "dt", default=0)
-    duration = _get(cfg, "time", "duration", default=0)
-    steps_raw = _get(cfg, "time", "steps", default=1800)
-
     ssp_depths = tuple(_get(cfg, "ssp", "depths", default=[0, 15, 35, 60, 90]))
     ssp_speeds = tuple(_get(cfg, "ssp", "speeds", default=[1535, 1518, 1492, 1503, 1520]))
-    cmax = max(ssp_speeds)
+    freq = _get(cfg, "source", "frequency", default=24000)
 
-    dt_auto = 0.45 / (cmax * ((1.0 / dx**2 + 1.0 / dy**2) ** 0.5))
-    dt = dt_raw if dt_raw and dt_raw > 0 else dt_auto
+    grid = auto_resolve_grid(
+        frequency_hz=freq,
+        c_min=min(ssp_speeds),
+        c_max=max(ssp_speeds),
+        width_m=_get(cfg, "grid", "width_m", default=None),
+        height_m=_get(cfg, "grid", "height_m", default=None),
+        dx=_get(cfg, "grid", "dx", default=0),
+        dy=_get(cfg, "grid", "dy", default=0),
+        dt=_get(cfg, "time", "dt", default=0),
+        nx=_get(cfg, "grid", "nx", default=0),
+        ny=_get(cfg, "grid", "ny", default=0),
+        cells_per_wavelength=_get(cfg, "grid", "cells_per_wavelength", default=10),
+    )
+    nx, ny = grid["nx"], grid["ny"]
+    dx, dy, dt = grid["dx"], grid["dy"], grid["dt"]
 
+    duration = _get(cfg, "time", "duration", default=0)
+    steps_raw = _get(cfg, "time", "steps", default=1800)
     if duration and duration > 0:
         steps = max(1, int(round(duration / dt)))
     else:
@@ -119,7 +160,7 @@ def config_to_sim(cfg: dict) -> PressureCASimConfig:
         source_ix=source_ix,
         source_iy=source_iy,
         source_amplitude_pa=_get(cfg, "source", "amplitude", default=1400.0),
-        source_frequency_hz=_get(cfg, "source", "frequency", default=24000),
+        source_frequency_hz=freq,
         ssp_depths_m=ssp_depths,
         ssp_speeds_mps=ssp_speeds,
         transfer_fraction=_get(cfg, "transfer", "fraction", default=0.42),
@@ -201,10 +242,14 @@ def _source_sinusoid(cfg: PressureCASimConfig, t_max: float, n_pts: int = 2000):
     return t, s
 
 
-def render_probe_plot(probes: list[Probe], cfg: PressureCASimConfig,
-                      plot_w: int, plot_h: int) -> pygame.Surface | None:
-    """Render a single combined plot with all probes overlaid via matplotlib Agg."""
-    if not probes or plot_w < 50 or plot_h < 50:
+def _render_probe_rgb(probe_data: list[dict], cfg: PressureCASimConfig,
+                      plot_w: int, plot_h: int) -> np.ndarray | None:
+    """Render probe plot to a numpy RGB array (thread-safe, no pygame calls).
+
+    probe_data: list of dicts with keys 'times', 'pressures', 'mpl_color', 'ix', 'iy'.
+    Returns (H, W, 3) uint8 array or None.
+    """
+    if not probe_data or plot_w < 50 or plot_h < 50:
         return None
 
     dpi = 100
@@ -217,13 +262,14 @@ def render_probe_plot(probes: list[Probe], cfg: PressureCASimConfig,
 
     t_max = 0.0
     has_data = False
-    for probe in probes:
-        if probe.times:
+    for pd in probe_data:
+        times, pressures = pd["times"], pd["pressures"]
+        if times:
             has_data = True
-            t_max = max(t_max, probe.times[-1])
-            ax.plot(probe.times, probe.pressures, "-",
-                    color=probe.mpl_color, linewidth=1.0,
-                    label=f"({probe.ix},{probe.iy}) d={probe.iy * cfg.dy:.0f}m",
+            t_max = max(t_max, times[-1])
+            ax.plot(times, pressures, "-",
+                    color=pd["mpl_color"], linewidth=1.0,
+                    label=f"({pd['ix']},{pd['iy']}) d={pd['iy'] * cfg.dy:.0f}m",
                     zorder=5)
 
     if has_data and t_max > 0:
@@ -251,12 +297,48 @@ def render_probe_plot(probes: list[Probe], cfg: PressureCASimConfig,
     canvas = FigureCanvasAgg(fig)
     canvas.draw()
     buf = canvas.buffer_rgba()
-    arr = np.asarray(buf)
+    arr = np.asarray(buf)[:, :, :3].copy()
     plt.close(fig)
+    return arr
 
-    rgb = arr[:, :, :3].copy()
-    surf = pygame.surfarray.make_surface(rgb.transpose(1, 0, 2))
-    return pygame.transform.scale(surf, (plot_w, plot_h))
+
+class _ProbePlotRenderer:
+    """Renders the probe plot in a background thread so it never blocks the main loop."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._latest_rgb: np.ndarray | None = None
+        self._surface: pygame.Surface | None = None
+        self._target_size: tuple[int, int] = (0, 0)
+
+    def request_render(self, probe_data: list[dict], cfg: PressureCASimConfig,
+                       plot_w: int, plot_h: int):
+        """Kick off a background render if one isn't already running."""
+        if self._thread is not None and self._thread.is_alive():
+            return  # previous render still running, skip
+        self._target_size = (plot_w, plot_h)
+        self._thread = threading.Thread(
+            target=self._worker, args=(probe_data, cfg, plot_w, plot_h),
+            daemon=True)
+        self._thread.start()
+
+    def _worker(self, probe_data, cfg, plot_w, plot_h):
+        rgb = _render_probe_rgb(probe_data, cfg, plot_w, plot_h)
+        with self._lock:
+            self._latest_rgb = rgb
+
+    def get_surface(self, target_w: int, target_h: int) -> pygame.Surface | None:
+        """Return the latest rendered surface (main thread only). Non-blocking."""
+        with self._lock:
+            rgb = self._latest_rgb
+        if rgb is not None:
+            try:
+                surf = pygame.surfarray.make_surface(rgb.transpose(1, 0, 2))
+                self._surface = pygame.transform.scale(surf, (target_w, target_h))
+            except Exception:
+                pass
+        return self._surface
 
 
 # ── Main GUI ──────────────────────────────────────────────────────────────
@@ -348,17 +430,22 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
     # ── Simulation / display state ──
 
     playing = False
-    steps_per_frame = 1
-    vmax_display = 1e-12        # tracks the running max with smooth decay
-    VMAX_DECAY = 0.998          # per-frame multiplicative decay
+    TARGET_FPS = 30
+    FRAME_BUDGET_S = 1.0 / TARGET_FPS
+    steps_per_frame = 10
+    spf_auto = True             # auto-tune spf to maintain TARGET_FPS
+    speed_level = 0             # +/- keys shift this; each level doubles spf target
+    sec_per_step = 0.001        # rolling estimate, updated each frame
+    steps_per_sec_smooth = 0.0
+    vmax_display = 1e-12
     probes: list[Probe] = []
     color_counter = 0
-    frame_history: list[np.ndarray] = []
+    frame_history: list[np.ndarray] = []   # only used in playback mode
     playback_idx = 0
-    probe_surface: pygame.Surface | None = None
     probe_dirty = True
     probe_redraw_counter = 0
-    PROBE_REDRAW_INTERVAL = 15
+    PROBE_REDRAW_INTERVAL = 20
+    plot_renderer = _ProbePlotRenderer()
 
     # ── Helper functions ──
 
@@ -398,8 +485,9 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
             return
         p = Probe(ix, iy, color_counter)
         color_counter += 1
-        for i, fld in enumerate(frame_history):
-            p.record(i * sim_cfg.dt, float(fld[iy, ix]))
+        if mode == "playback":
+            for i, fld in enumerate(frame_history):
+                p.record(i * sim_cfg.dt, float(fld[iy, ix]))
         probes.append(p)
         probe_dirty = True
         if not layout.panel_visible:
@@ -438,7 +526,14 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
 
     def render_field(p_field):
         native_surf = field_to_surface(p_field, vmax_display)
-        scaled = pygame.transform.scale(native_surf, (layout.grid_w, layout.grid_h))
+        tw, th = layout.grid_w, layout.grid_h
+        # smoothscale when downscaling (cells < pixels) to avoid moire;
+        # regular scale when upscaling (cells > pixels) for sharp edges.
+        nw, nh = native_surf.get_size()
+        if nw > tw or nh > th:
+            scaled = pygame.transform.smoothscale(native_surf, (tw, th))
+        else:
+            scaled = pygame.transform.scale(native_surf, (tw, th))
         screen.blit(scaled, (0, 0))
 
         overlay = layout.grid_overlay()
@@ -475,7 +570,7 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
             screen.blit(label, (lx, ly))
 
     def render_panel():
-        nonlocal probe_surface, probe_dirty
+        nonlocal probe_dirty
         if not layout.panel_visible:
             legend_rects.clear()
             return
@@ -487,12 +582,11 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
         legend_rects.clear()
         legend_y = 4
         for i, p in enumerate(probes):
-            label_text = f"  ■ ({p.ix},{p.iy}) d={p.iy * sim_cfg.dy:.0f}m  ✕ "
+            label_text = f"  \u25a0 ({p.ix},{p.iy}) d={p.iy * sim_cfg.dy:.0f}m  \u2715 "
             label_surf = small_font.render(label_text, True, p.color)
             lw = label_surf.get_width()
             lh = LEGEND_ROW_H
             rect = pygame.Rect(px + 4, legend_y, lw + 4, lh)
-            # Hover highlight
             mx, my = pygame.mouse.get_pos()
             if rect.collidepoint(mx, my):
                 pygame.draw.rect(screen, (60, 60, 60), rect, border_radius=3)
@@ -503,23 +597,29 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
         legend_total_h = legend_y + 2
         plot_h = layout.grid_h - legend_total_h
 
-        # ── Combined matplotlib plot below legend ──
-        if probe_dirty or probe_surface is None:
-            probe_surface = render_probe_plot(probes, sim_cfg,
-                                              layout.panel_w, max(60, plot_h))
+        # ── Kick off background render if dirty; blit latest available surface ──
+        if probe_dirty:
+            snap = [{"times": list(p.times), "pressures": list(p.pressures),
+                     "mpl_color": p.mpl_color, "ix": p.ix, "iy": p.iy}
+                    for p in probes]
+            plot_renderer.request_render(snap, sim_cfg,
+                                         layout.panel_w, max(60, plot_h))
             probe_dirty = False
 
-        if probe_surface:
-            screen.blit(probe_surface, (px, legend_total_h))
+        surf = plot_renderer.get_surface(layout.panel_w, max(60, plot_h))
+        if surf:
+            screen.blit(surf, (px, legend_total_h))
 
-    def render_hud(step_num, t, fps_val, backend, mode_str, spf):
+    def render_hud(step_num, t, fps_val, backend, mode_str, spf, sps=0.0):
         rect = pygame.Rect(0, layout.grid_h, layout.win_w, HUD_H)
         pygame.draw.rect(screen, (30, 30, 30), rect)
         state = "PLAY" if playing else "PAUSE"
+        sps_str = f"{sps/1000:.1f}k" if sps >= 1000 else f"{sps:.0f}"
+        speed_str = f"speed {speed_level:+d}"
         txt = (f" step {step_num:>6d}  t={t:.5f}s  |  {fps_val:.0f}fps  |  "
-               f"{backend}  |  {mode_str}  |  spf={spf}  |  [{state}]  |  "
-               f"vmax={vmax_display:.2e}  |  "
-               f"click=probe  rclick=remove  space=play  +/-=speed  R=reset")
+               f"{sps_str} steps/s  |  spf={spf}  |  {speed_str}  |  "
+               f"{backend}  |  [{state}]  |  vmax={vmax_display:.2e}  |  "
+               f"space=play  +/-=speed  R=reset  click=probe")
         surf = font.render(txt, True, HUD_FG)
         screen.blit(surf, (4, layout.grid_h + 7))
 
@@ -556,7 +656,6 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
                 elif ev.key == pygame.K_r:
                     if mode == "live":
                         stepper.reset()
-                        frame_history.clear()
                         for p in probes:
                             p.clear()
                         probe_dirty = True
@@ -565,15 +664,16 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
                     else:
                         playback_idx = 0
                 elif ev.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
-                    steps_per_frame = min(100, steps_per_frame + 1)
+                    speed_level = min(20, speed_level + 1)
                 elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
-                    steps_per_frame = max(1, steps_per_frame - 1)
+                    speed_level = max(-5, speed_level - 1)
                 elif ev.key == pygame.K_RIGHT and not playing:
                     if mode == "live":
-                        current_field = stepper.step()
-                        frame_history.append(current_field)
-                        for p in probes:
-                            p.record(stepper.current_time, float(current_field[p.iy, p.ix]))
+                        pc = [(p.ix, p.iy) for p in probes] if probes else None
+                        current_field, pv, pt = stepper.step_n(1, pc)
+                        if pv is not None:
+                            for j, p in enumerate(probes):
+                                p.record(float(pt[0]), float(pv[0, j]))
                         probe_dirty = True
                     elif mode == "playback" and playback_idx < len(frame_history) - 1:
                         playback_idx += 1
@@ -591,37 +691,57 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
                 elif ev.button == 3:
                     handle_click_remove(*ev.pos)
 
-        # Advance simulation
+        # Advance simulation — auto-tune spf to stay within frame budget
+        sim_steps_this_frame = 0
+        t_sim_start = _time.perf_counter()
         if playing:
             if mode == "live":
-                for _ in range(steps_per_frame):
-                    current_field = stepper.step()
-                    frame_history.append(current_field)
-                    for p in probes:
-                        p.record(stepper.current_time, float(current_field[p.iy, p.ix]))
+                # Target spf: base 10 * 2^speed_level, clamped to [1, 500000]
+                target_spf = max(1, min(500000, int(10 * (2.0 ** speed_level))))
+                # Auto-tune: estimate how many steps we can afford in the budget
+                if sec_per_step > 0:
+                    affordable = max(1, int(FRAME_BUDGET_S * 0.7 / sec_per_step))
+                else:
+                    affordable = target_spf
+                steps_per_frame = min(target_spf, affordable)
+
+                probe_cells = [(p.ix, p.iy) for p in probes] if probes else None
+                pstride = max(1, steps_per_frame // 200)
+                current_field, pv, pt = stepper.step_n(
+                    steps_per_frame, probe_cells, probe_stride=pstride)
+                sim_steps_this_frame = steps_per_frame
+                if pv is not None:
+                    for row_t, row_v in zip(pt, pv):
+                        for j, p in enumerate(probes):
+                            p.record(float(row_t), float(row_v[j]))
                 probe_dirty = True
             elif mode == "playback":
                 playback_idx = min(playback_idx + steps_per_frame, len(frame_history) - 1)
                 current_field = frame_history[playback_idx]
                 if playback_idx >= len(frame_history) - 1:
                     playing = False
+        t_sim_elapsed = _time.perf_counter() - t_sim_start
+        if t_sim_elapsed > 0 and sim_steps_this_frame > 0:
+            measured_sps = sim_steps_this_frame / t_sim_elapsed
+            sec_per_step = 0.8 * sec_per_step + 0.2 * (t_sim_elapsed / sim_steps_this_frame)
+            steps_per_sec_smooth = 0.9 * steps_per_sec_smooth + 0.1 * measured_sps
 
         # Dynamic color scaling: track field peak, decay slowly so colors stay stable
         field_max = float(np.max(np.abs(current_field)))
         if field_max > vmax_display:
             vmax_display = field_max
         else:
-            vmax_display = max(field_max, vmax_display * VMAX_DECAY)
+            vmax_display = max(field_max, vmax_display * 0.998)
         vmax_display = max(vmax_display, 1e-30)
 
         # Render
         render_field(current_field)
 
+        # Throttle probe plot re-renders (background thread handles the heavy work)
         probe_redraw_counter += 1
-        if probe_redraw_counter >= PROBE_REDRAW_INTERVAL:
+        if probe_redraw_counter >= PROBE_REDRAW_INTERVAL and playing:
             probe_redraw_counter = 0
-            if probes and probe_dirty:
-                probe_dirty = True
+            probe_dirty = True
         render_panel()
 
         if mode == "live":
@@ -632,9 +752,10 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
             t = playback_idx * sim_cfg.dt
 
         fps_val = clock.get_fps()
-        render_hud(step_num, t, fps_val, stepper.backend_name, mode, steps_per_frame)
+        render_hud(step_num, t, fps_val, stepper.backend_name, mode,
+                   steps_per_frame, steps_per_sec_smooth)
         pygame.display.flip()
-        clock.tick(60)
+        clock.tick(0)  # no cap — auto-tuning handles pacing
 
     pygame.quit()
 
