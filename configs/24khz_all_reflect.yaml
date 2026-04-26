@@ -20,11 +20,12 @@ grid:
   width_m: 8.0       # 3 metre wide tank
   height_m: 4.0      # 1.5 metre deep tank
   cells_per_wavelength: 10  # 6 is enough for GUI exploration; 10 for accuracy
+  # stencil_order: 4   # uncomment for 4th-order stencil (needs only ~5 cpw)
   # dx: 1
   # dy: 0.5
 time:
   dt: 0              # auto CFL-safe (≈1.3 μs)
-  duration: 0.02     # 20 ms — sound crosses the 3 m tank ~10 times
+  duration: 1.0     # 20 ms — sound crosses the 3 m tank ~10 times
 
 model:
   type: wave
@@ -49,6 +50,6 @@ ssp:
 backend: auto
 
 output:
-  frame_stride: 20
+  frame_stride: 500    # 756k steps / 500 = ~1500 frames, keeps replay manageable
   gif_fps: 30
   tag: 24khz_all_reflect

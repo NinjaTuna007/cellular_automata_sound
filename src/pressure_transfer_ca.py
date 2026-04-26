@@ -113,6 +113,10 @@ class PressureCASimConfig:
     left_open_y_ranges: Tuple[Tuple[int, int], ...] = ()
     right_open_y_ranges: Tuple[Tuple[int, int], ...] = ()
 
+    # Spatial finite-difference order: 2 (standard 5-point) or 4 (wider 9-point).
+    # 4th-order needs only ~4 cells/wavelength vs ~10 for 2nd-order.
+    stencil_order: int = 2
+
     # Execution backends: "auto", "cpu", "gpu"
     backend: str = "auto"
     # Numeric dtype for simulation arrays.
@@ -127,6 +131,170 @@ class PressureCASimConfig:
 
     # Frame sampling for visualization
     frame_stride: int = 2
+
+
+def _default_progress(step: int, total: int):
+    """Print a percentage progress line to stdout, reusing the same line."""
+    pct = step * 100 / total
+    print(f"\r  Progress: {step:>8d}/{total} ({pct:5.1f}%)", end="", flush=True)
+
+
+MAX_FRAME_DIM = 2048
+
+
+def _downsample_frame(frame: np.ndarray, ds: int) -> np.ndarray:
+    """Block-mean downsample a 2-D array by integer factor *ds*."""
+    if ds <= 1:
+        return frame
+    ny, nx = frame.shape
+    ty = ny - ny % ds
+    tx = nx - nx % ds
+    return frame[:ty, :tx].reshape(ty // ds, ds, tx // ds, ds).mean(axis=(1, 3))
+
+
+class _FrameSink:
+    """Accumulates simulation frames in RAM or on disk.
+
+    Frames larger than *max_dim* on either axis are block-averaged down
+    before storage so replay data stays compact.  When the (post-
+    downsample) estimated total exceeds *max_ram_bytes* the sink writes
+    frames sequentially to a flat binary file in *disk_dir*.
+    """
+
+    def __init__(self, ny: int, nx: int, n_frames: int,
+                 dtype=np.float32, max_ram_bytes: int = 4 * 1024**3,
+                 disk_dir: str | None = None,
+                 max_dim: int = MAX_FRAME_DIM):
+        self.orig_ny, self.orig_nx = ny, nx
+        self.dtype = np.dtype(dtype)
+
+        # Spatial downsample factor for storage
+        self.ds = 1
+        while ny // self.ds > max_dim or nx // self.ds > max_dim:
+            self.ds += 1
+        self.ny = ny // self.ds if self.ds > 1 else ny
+        self.nx = nx // self.ds if self.ds > 1 else nx
+        if self.ds > 1:
+            # Trim to exact multiple
+            self.ny = (ny - ny % self.ds) // self.ds
+            self.nx = (nx - nx % self.ds) // self.ds
+
+        self.count = 0
+        self._frame_nbytes = self.ny * self.nx * self.dtype.itemsize
+        total_bytes = n_frames * self._frame_nbytes
+
+        if total_bytes <= max_ram_bytes:
+            self._mode = "ram"
+            self._frames: list[np.ndarray] = []
+            self._path = None
+            self._fh = None
+        else:
+            self._mode = "disk"
+            self._frames = []
+            if disk_dir is None:
+                disk_dir = os.path.dirname(os.path.abspath(__file__))
+            os.makedirs(disk_dir, exist_ok=True)
+            self._path = os.path.join(disk_dir, "_frames_cache.bin")
+            self._fh = open(self._path, "wb")
+
+    def append(self, frame):
+        """Store one frame, downsampling if needed."""
+        arr = np.asarray(frame, dtype=self.dtype)
+        if self.ds > 1:
+            arr = _downsample_frame(arr, self.ds).astype(self.dtype)
+        if not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        if self._mode == "ram":
+            self._frames.append(arr)
+        else:
+            self._fh.write(arr.tobytes())
+        self.count += 1
+
+    @property
+    def frames(self):
+        """Return an indexable, iterable sequence of stored frames."""
+        if self._mode == "ram":
+            return self._frames
+        if self._fh and not self._fh.closed:
+            self._fh.flush()
+        return _DiskFrameReader(self._path, self.count,
+                                self.ny, self.nx, self.dtype)
+
+    @property
+    def disk_path(self) -> str | None:
+        return self._path
+
+    @property
+    def estimated_bytes(self) -> int:
+        return self.count * self._frame_nbytes
+
+    def write_meta(self):
+        """Write a JSON sidecar with frame dimensions so the replay loader
+        can read the .bin without guessing."""
+        if self._path is None:
+            return
+        import json
+        meta_path = self._path.replace(".bin", "_meta.json")
+        with open(meta_path, "w") as f:
+            json.dump({
+                "ny": self.ny, "nx": self.nx,
+                "orig_ny": self.orig_ny, "orig_nx": self.orig_nx,
+                "ds": self.ds, "count": self.count,
+                "dtype": str(self.dtype),
+            }, f)
+
+    def cleanup(self):
+        if self._fh and not self._fh.closed:
+            self._fh.close()
+        if self._path:
+            try:
+                os.unlink(self._path)
+                meta = self._path.replace(".bin", "_meta.json")
+                if os.path.exists(meta):
+                    os.unlink(meta)
+            except OSError:
+                pass
+
+
+class _DiskFrameReader:
+    """Lazy reader for frames stored in a flat binary file.
+
+    Supports ``len()``, indexing (``reader[i]``), and iteration
+    without loading every frame into RAM at once.
+    """
+
+    def __init__(self, path: str, count: int, ny: int, nx: int, dtype):
+        self._path = path
+        self._count = count
+        self._ny, self._nx = ny, nx
+        self._dtype = np.dtype(dtype)
+        self._frame_nbytes = ny * nx * self._dtype.itemsize
+        self._fh = open(path, "rb")
+
+    def __del__(self):
+        if hasattr(self, "_fh") and self._fh and not self._fh.closed:
+            self._fh.close()
+
+    def __len__(self):
+        return self._count
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return [self[i] for i in range(*idx.indices(self._count))]
+        if idx < 0:
+            idx += self._count
+        if not 0 <= idx < self._count:
+            raise IndexError(idx)
+        self._fh.seek(idx * self._frame_nbytes)
+        buf = self._fh.read(self._frame_nbytes)
+        return np.frombuffer(buf, dtype=self._dtype).reshape(self._ny, self._nx)
+
+    def __iter__(self):
+        self._fh.seek(0)
+        for _ in range(self._count):
+            buf = self._fh.read(self._frame_nbytes)
+            yield np.frombuffer(buf, dtype=self._dtype).reshape(
+                self._ny, self._nx)
 
 
 def _neighbor_offsets() -> List[Tuple[int, int]]:
@@ -295,6 +463,8 @@ def _run_numpy_backend(
     static_pressure: np.ndarray,
     sound_speed: np.ndarray,
     tables: Dict[str, np.ndarray],
+    frame_sink: _FrameSink | None = None,
+    progress_fn=None,
 ):
     dtype = _sim_dtype(cfg)
     alpha = tables["alpha"].astype(dtype, copy=False)
@@ -304,8 +474,10 @@ def _run_numpy_backend(
     offsets = tables["offsets"]
 
     extra = np.zeros((cfg.ny, cfg.nx), dtype=dtype)
-    frames_extra: List[np.ndarray] = []
+    use_sink = frame_sink is not None
+    frames_extra: List[np.ndarray] = [] if not use_sink else []
     source_trace = np.zeros(cfg.steps, dtype=dtype)
+    progress_interval = max(1, cfg.steps // 200)
 
     for step in range(cfg.steps):
         t = step * cfg.dt
@@ -336,7 +508,16 @@ def _run_numpy_backend(
 
         extra = next_extra
         if step % max(1, cfg.frame_stride) == 0:
-            frames_extra.append(extra.copy())
+            if use_sink:
+                frame_sink.append(extra.copy())
+            else:
+                frames_extra.append(extra.copy())
+
+        if progress_fn and step % progress_interval == 0:
+            progress_fn(step, cfg.steps)
+
+    if progress_fn:
+        progress_fn(cfg.steps, cfg.steps)
 
     return {
         "backend_used": "cpu-numpy-vectorized",
@@ -344,7 +525,7 @@ def _run_numpy_backend(
         "sound_speed": sound_speed.astype(dtype, copy=False),
         "final_extra_pressure": extra,
         "final_total_pressure": static_pressure.astype(dtype, copy=False) + extra,
-        "frames_extra": frames_extra,
+        "frames_extra": frame_sink.frames if use_sink else frames_extra,
         "source_trace_extra": source_trace,
     }
 
@@ -354,6 +535,8 @@ def _run_cupy_backend(
     static_pressure: np.ndarray,
     sound_speed: np.ndarray,
     tables: Dict[str, np.ndarray],
+    frame_sink: _FrameSink | None = None,
+    progress_fn=None,
 ):
     if not CUPY_AVAILABLE:
         raise RuntimeError("CuPy backend requested but cupy is not available.")
@@ -369,8 +552,10 @@ def _run_cupy_backend(
     offsets = tables["offsets"]
 
     extra = cp.zeros((cfg.ny, cfg.nx), dtype=dtype_cp)
-    frames_extra: List[np.ndarray] = []
+    use_sink = frame_sink is not None
+    frames_extra: List[np.ndarray] = [] if not use_sink else []
     source_trace = np.zeros(cfg.steps, dtype=dtype_np)
+    progress_interval = max(1, cfg.steps // 200)
 
     for step in range(cfg.steps):
         t = step * cfg.dt
@@ -400,7 +585,17 @@ def _run_cupy_backend(
 
         extra = next_extra
         if step % max(1, cfg.frame_stride) == 0:
-            frames_extra.append(cp.asnumpy(extra))
+            frame_np = cp.asnumpy(extra)
+            if use_sink:
+                frame_sink.append(frame_np)
+            else:
+                frames_extra.append(frame_np)
+
+        if progress_fn and step % progress_interval == 0:
+            progress_fn(step, cfg.steps)
+
+    if progress_fn:
+        progress_fn(cfg.steps, cfg.steps)
 
     cp.cuda.Stream.null.synchronize()
     extra_np = cp.asnumpy(extra)
@@ -410,7 +605,7 @@ def _run_cupy_backend(
         "sound_speed": sound_speed.astype(dtype_np, copy=False),
         "final_extra_pressure": extra_np,
         "final_total_pressure": static_pressure.astype(dtype_np, copy=False) + extra_np,
-        "frames_extra": frames_extra,
+        "frames_extra": frame_sink.frames if use_sink else frames_extra,
         "source_trace_extra": source_trace,
     }
 
@@ -419,14 +614,17 @@ def _check_wave_cfl(cfg: PressureCASimConfig, sound_speed: np.ndarray):
     cmax = float(np.max(sound_speed))
     cmin = float(np.min(sound_speed))
     cfl = cmax * cfg.dt * np.sqrt((1.0 / (cfg.dx * cfg.dx)) + (1.0 / (cfg.dy * cfg.dy)))
-    if cfl >= 1.0:
+
+    # 4th-order spatial stencil has a tighter stability limit: sqrt(3/4) ≈ 0.866
+    cfl_limit = 0.866 if cfg.stencil_order >= 4 else 1.0
+    if cfl >= cfl_limit:
         raise ValueError(
-            f"Wave CFL unstable: {cfl:.3f} >= 1.0. Reduce dt or increase dx/dy."
+            f"Wave CFL unstable: {cfl:.3f} >= {cfl_limit:.3f} "
+            f"(stencil_order={cfg.stencil_order}). Reduce dt or increase dx/dy."
         )
 
     f = cfg.source_frequency_hz
     if f > 0:
-        # Temporal Nyquist: need at least 2 samples per cycle (preferably ≥10)
         f_nyquist = 0.5 / cfg.dt
         if f > f_nyquist:
             import warnings
@@ -444,23 +642,25 @@ def _check_wave_cfl(cfg: PressureCASimConfig, sound_speed: np.ndarray):
                 stacklevel=3,
             )
 
-        # Spatial: need ≥5 cells per wavelength for reasonable accuracy
         dx_max = max(cfg.dx, cfg.dy)
         wavelength = cmin / f
         cells_per_lambda = wavelength / dx_max
-        if cells_per_lambda < 2.0:
+        # 4th-order stencils need fewer cells/wavelength for equivalent accuracy
+        min_cpw = 2.0 if cfg.stencil_order >= 4 else 2.0
+        warn_cpw = 3.0 if cfg.stencil_order >= 4 else 5.0
+        if cells_per_lambda < min_cpw:
             import warnings
             warnings.warn(
-                f"Wavelength {wavelength:.2f}m < 2 cells ({dx_max:.2f}m). "
+                f"Wavelength {wavelength:.2f}m < {min_cpw:.0f} cells ({dx_max:.2f}m). "
                 f"Grid cannot represent {f:.0f} Hz. Lower frequency or reduce dx/dy.",
                 stacklevel=3,
             )
-        elif cells_per_lambda < 5.0:
+        elif cells_per_lambda < warn_cpw:
             import warnings
             warnings.warn(
                 f"Only {cells_per_lambda:.1f} cells/wavelength for {f:.0f} Hz "
-                f"(λ={wavelength:.2f}m, dx={dx_max:.2f}m). "
-                f"Results may be inaccurate — prefer ≥5 cells/λ.",
+                f"(λ={wavelength:.2f}m, dx={dx_max:.2f}m, stencil={cfg.stencil_order}). "
+                f"Results may be inaccurate — prefer ≥{warn_cpw:.0f} cells/λ.",
                 stacklevel=3,
             )
 
@@ -476,16 +676,23 @@ def auto_resolve_grid(
     dt: float = 0.0,
     nx: int = 0,
     ny: int = 0,
-    cells_per_wavelength: int = 10,
+    cells_per_wavelength: int = 0,
     cfl_factor: float = 0.45,
+    stencil_order: int = 2,
 ) -> dict:
     """Compute grid/time parameters that avoid aliasing for a given frequency.
 
     Any parameter left at 0 (or None for sizes) is auto-computed.
     Explicitly provided non-zero values are kept as-is.
 
+    *stencil_order* controls the default ``cells_per_wavelength`` when the
+    caller doesn't provide one: 10 for 2nd-order, 5 for 4th-order.
+
     Returns dict with keys: dx, dy, dt, nx, ny, width_m, height_m.
     """
+    if cells_per_wavelength <= 0:
+        cells_per_wavelength = 5 if stencil_order >= 4 else 10
+
     wl_min = c_min / max(frequency_hz, 1e-6)
 
     if dx <= 0:
@@ -550,12 +757,16 @@ def _run_wave_numpy_backend(
     cfg: PressureCASimConfig,
     static_pressure: np.ndarray,
     sound_speed: np.ndarray,
+    frame_sink: _FrameSink | None = None,
+    progress_fn=None,
 ):
     dtype = _sim_dtype(cfg)
     p_prev = np.zeros((cfg.ny, cfg.nx), dtype=dtype)
     p = np.zeros((cfg.ny, cfg.nx), dtype=dtype)
-    frames_extra: List[np.ndarray] = []
+    use_sink = frame_sink is not None
+    frames_extra: List[np.ndarray] = [] if not use_sink else []
     source_trace = np.zeros(cfg.steps, dtype=dtype)
+    progress_interval = max(1, cfg.steps // 200)
 
     inv_dx2 = dtype(1.0 / (cfg.dx * cfg.dx))
     inv_dy2 = dtype(1.0 / (cfg.dy * cfg.dy))
@@ -566,6 +777,9 @@ def _run_wave_numpy_backend(
     bottom_reflect = boundary_profiles["bottom"].astype(dtype, copy=False)
     left_reflect = boundary_profiles["left"].astype(dtype, copy=False)
     right_reflect = boundary_profiles["right"].astype(dtype, copy=False)
+
+    use_4th = cfg.stencil_order >= 4 and cfg.ny > 4 and cfg.nx > 4
+    inv12 = dtype(1.0 / 12.0)
 
     for step in range(cfg.steps):
         t = step * cfg.dt
@@ -581,7 +795,19 @@ def _run_wave_numpy_backend(
             + c2dt2[1:-1, 1:-1] * lap
         )
 
-        # Boundary reflections.
+        if use_4th:
+            lap4 = (
+                (-p[2:-2, 4:] + dtype(16.0) * p[2:-2, 3:-1] - dtype(30.0) * p[2:-2, 2:-2]
+                 + dtype(16.0) * p[2:-2, 1:-3] - p[2:-2, :-4]) * inv_dx2 * inv12
+                + (-p[4:, 2:-2] + dtype(16.0) * p[3:-1, 2:-2] - dtype(30.0) * p[2:-2, 2:-2]
+                   + dtype(16.0) * p[1:-3, 2:-2] - p[:-4, 2:-2]) * inv_dy2 * inv12
+            )
+            p_next[2:-2, 2:-2] = (
+                (dtype(2.0) - sigma_dt) * p[2:-2, 2:-2]
+                - (dtype(1.0) - sigma_dt) * p_prev[2:-2, 2:-2]
+                + c2dt2[2:-2, 2:-2] * lap4
+            )
+
         p_next[0, :] = top_reflect * p_next[1, :]
         p_next[-1, :] = bottom_reflect * p_next[-2, :]
         p_next[:, 0] = left_reflect * p_next[:, 1]
@@ -593,7 +819,16 @@ def _run_wave_numpy_backend(
 
         p_prev, p = p, p_next
         if step % max(1, cfg.frame_stride) == 0:
-            frames_extra.append(p.copy())
+            if use_sink:
+                frame_sink.append(p.copy())
+            else:
+                frames_extra.append(p.copy())
+
+        if progress_fn and step % progress_interval == 0:
+            progress_fn(step, cfg.steps)
+
+    if progress_fn:
+        progress_fn(cfg.steps, cfg.steps)
 
     return {
         "backend_used": "cpu-numpy-wave",
@@ -601,7 +836,7 @@ def _run_wave_numpy_backend(
         "sound_speed": sound_speed.astype(dtype, copy=False),
         "final_extra_pressure": p,
         "final_total_pressure": static_pressure.astype(dtype, copy=False) + p,
-        "frames_extra": frames_extra,
+        "frames_extra": frame_sink.frames if use_sink else frames_extra,
         "source_trace_extra": source_trace,
     }
 
@@ -638,11 +873,54 @@ def _build_numba_wave_kernel():
     return _step
 
 
+def _build_numba_wave_kernel_4th():
+    """JIT-compile the 4th-order fused wave step."""
+    if not NUMBA_AVAILABLE:
+        return None
+
+    @nb.njit(cache=True, fastmath=True, parallel=True)
+    def _step(p, p_prev, p_next, c2dt2, inv_dx2, inv_dy2, sigma_dt,
+              top_r, bot_r, left_r, right_r):
+        ny = p.shape[0]
+        nx = p.shape[1]
+        two_m_s = 2.0 - sigma_dt
+        one_m_s = 1.0 - sigma_dt
+        inv12 = 1.0 / 12.0
+        for j in nb.prange(1, ny - 1):
+            for i in range(1, nx - 1):
+                center = p[j, i]
+                if j >= 2 and j < ny - 2 and i >= 2 and i < nx - 2:
+                    lap_x = (-p[j, i + 2] + 16.0 * p[j, i + 1] - 30.0 * center
+                             + 16.0 * p[j, i - 1] - p[j, i - 2]) * inv_dx2 * inv12
+                    lap_y = (-p[j + 2, i] + 16.0 * p[j + 1, i] - 30.0 * center
+                             + 16.0 * p[j - 1, i] - p[j - 2, i]) * inv_dy2 * inv12
+                    lap = lap_x + lap_y
+                else:
+                    lap = ((p[j, i + 1] - 2.0 * center + p[j, i - 1]) * inv_dx2
+                           + (p[j + 1, i] - 2.0 * center + p[j - 1, i]) * inv_dy2)
+                p_next[j, i] = (two_m_s * center
+                                - one_m_s * p_prev[j, i]
+                                + c2dt2[j, i] * lap)
+        for i in range(nx):
+            p_next[0, i] = top_r[i] * p_next[1, i]
+            p_next[ny - 1, i] = bot_r[i] * p_next[ny - 2, i]
+        for j in range(ny):
+            p_next[j, 0] = left_r[j] * p_next[j, 1]
+            p_next[j, nx - 1] = right_r[j] * p_next[j, nx - 2]
+
+    return _step
+
+
 _numba_wave_step = None
+_numba_wave_step_4th = None
 
 
-def _get_numba_wave_step():
-    global _numba_wave_step
+def _get_numba_wave_step(stencil_order: int = 2):
+    global _numba_wave_step, _numba_wave_step_4th
+    if stencil_order >= 4:
+        if _numba_wave_step_4th is None:
+            _numba_wave_step_4th = _build_numba_wave_kernel_4th()
+        return _numba_wave_step_4th
     if _numba_wave_step is None:
         _numba_wave_step = _build_numba_wave_kernel()
     return _numba_wave_step
@@ -652,10 +930,12 @@ def _run_wave_numba_backend(
     cfg: PressureCASimConfig,
     static_pressure: np.ndarray,
     sound_speed: np.ndarray,
+    frame_sink: _FrameSink | None = None,
+    progress_fn=None,
 ):
     if not NUMBA_AVAILABLE:
         raise RuntimeError("Numba not available.")
-    kernel = _get_numba_wave_step()
+    kernel = _get_numba_wave_step(cfg.stencil_order)
     if kernel is None:
         raise RuntimeError("Failed to compile Numba kernel.")
 
@@ -663,8 +943,10 @@ def _run_wave_numba_backend(
     p_prev = np.zeros((cfg.ny, cfg.nx), dtype=dtype)
     p = np.zeros((cfg.ny, cfg.nx), dtype=dtype)
     p_next = np.zeros((cfg.ny, cfg.nx), dtype=dtype)
-    frames_extra: List[np.ndarray] = []
+    use_sink = frame_sink is not None
+    frames_extra: List[np.ndarray] = [] if not use_sink else []
     source_trace = np.zeros(cfg.steps, dtype=dtype)
+    progress_interval = max(1, cfg.steps // 200)
 
     inv_dx2 = dtype(1.0 / (cfg.dx * cfg.dx))
     inv_dy2 = dtype(1.0 / (cfg.dy * cfg.dy))
@@ -676,7 +958,6 @@ def _run_wave_numba_backend(
     left_r = bnd["left"].astype(dtype, copy=False)
     right_r = bnd["right"].astype(dtype, copy=False)
 
-    # Warm up JIT (first call compiles; subsequent calls use cache).
     kernel(p, p_prev, p_next, c2dt2, inv_dx2, inv_dy2, sigma_dt,
            top_r, bot_r, left_r, right_r)
     p.fill(0); p_prev.fill(0); p_next.fill(0)
@@ -692,7 +973,16 @@ def _run_wave_numba_backend(
 
         p_prev, p, p_next = p, p_next, p_prev
         if step % max(1, cfg.frame_stride) == 0:
-            frames_extra.append(p.copy())
+            if use_sink:
+                frame_sink.append(p.copy())
+            else:
+                frames_extra.append(p.copy())
+
+        if progress_fn and step % progress_interval == 0:
+            progress_fn(step, cfg.steps)
+
+    if progress_fn:
+        progress_fn(cfg.steps, cfg.steps)
 
     n_threads = nb.config.NUMBA_NUM_THREADS
     return {
@@ -701,7 +991,7 @@ def _run_wave_numba_backend(
         "sound_speed": sound_speed.astype(dtype, copy=False),
         "final_extra_pressure": p,
         "final_total_pressure": static_pressure.astype(dtype, copy=False) + p,
-        "frames_extra": frames_extra,
+        "frames_extra": frame_sink.frames if use_sink else frames_extra,
         "source_trace_extra": source_trace,
     }
 
@@ -756,6 +1046,74 @@ void wave_step_f64(
 }
 '''
 
+# ─── 4th-order spatial stencil CUDA kernels ─────────────────────────────────
+# Deep interior (j in [2,ny-3], i in [2,nx-3]) uses 4th-order coefficients:
+#   d²f/dx² ≈ (-f[i+2] + 16·f[i+1] - 30·f[i] + 16·f[i-1] - f[i-2]) / (12·dx²)
+# The 1-cell ring adjacent to boundaries falls back to the standard 2nd-order
+# stencil because it lacks the ±2 neighbors.
+
+_WAVE_CUDA_4TH_SRC_F32 = r'''
+extern "C" __global__
+void wave_step_4th_f32(
+    const float* __restrict__ p,
+    const float* __restrict__ p_prev,
+    const float* __restrict__ c2dt2,
+    float* __restrict__ p_next,
+    const int ny, const int nx,
+    const float inv_dx2, const float inv_dy2,
+    const float two_m_s, const float one_m_s
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= ny * nx) return;
+    int j = idx / nx;
+    int i = idx % nx;
+    if (j < 1 || j >= ny - 1 || i < 1 || i >= nx - 1) return;
+
+    float c = p[idx];
+    float lap;
+    if (j >= 2 && j < ny - 2 && i >= 2 && i < nx - 2) {
+        float inv12 = 1.0f / 12.0f;
+        lap = (-p[idx+2] + 16.0f*p[idx+1] - 30.0f*c + 16.0f*p[idx-1] - p[idx-2]) * inv_dx2 * inv12
+            + (-p[idx+2*nx] + 16.0f*p[idx+nx] - 30.0f*c + 16.0f*p[idx-nx] - p[idx-2*nx]) * inv_dy2 * inv12;
+    } else {
+        lap = (p[idx+1] - 2.0f*c + p[idx-1]) * inv_dx2
+            + (p[idx+nx] - 2.0f*c + p[idx-nx]) * inv_dy2;
+    }
+    p_next[idx] = two_m_s*c - one_m_s*p_prev[idx] + c2dt2[idx]*lap;
+}
+'''
+
+_WAVE_CUDA_4TH_SRC_F64 = r'''
+extern "C" __global__
+void wave_step_4th_f64(
+    const double* __restrict__ p,
+    const double* __restrict__ p_prev,
+    const double* __restrict__ c2dt2,
+    double* __restrict__ p_next,
+    const int ny, const int nx,
+    const double inv_dx2, const double inv_dy2,
+    const double two_m_s, const double one_m_s
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= ny * nx) return;
+    int j = idx / nx;
+    int i = idx % nx;
+    if (j < 1 || j >= ny - 1 || i < 1 || i >= nx - 1) return;
+
+    double c = p[idx];
+    double lap;
+    if (j >= 2 && j < ny - 2 && i >= 2 && i < nx - 2) {
+        double inv12 = 1.0 / 12.0;
+        lap = (-p[idx+2] + 16.0*p[idx+1] - 30.0*c + 16.0*p[idx-1] - p[idx-2]) * inv_dx2 * inv12
+            + (-p[idx+2*nx] + 16.0*p[idx+nx] - 30.0*c + 16.0*p[idx-nx] - p[idx-2*nx]) * inv_dy2 * inv12;
+    } else {
+        lap = (p[idx+1] - 2.0*c + p[idx-1]) * inv_dx2
+            + (p[idx+nx] - 2.0*c + p[idx-nx]) * inv_dy2;
+    }
+    p_next[idx] = two_m_s*c - one_m_s*p_prev[idx] + c2dt2[idx]*lap;
+}
+'''
+
 # Boundary + source kernel: applied AFTER the interior update kernel.
 # Runs on boundary cells only (max 2*(nx+ny) threads) -- very lightweight.
 _WAVE_BOUNDARY_CUDA_TEMPLATE = r'''
@@ -802,13 +1160,17 @@ void wave_boundary_{T}(
 _cuda_kernels: dict = {}
 
 
-def _get_cuda_wave_kernel(use_float32: bool):
-    key = "f32" if use_float32 else "f64"
+def _get_cuda_wave_kernel(use_float32: bool, stencil_order: int = 2):
+    is_4th = stencil_order >= 4
+    key = ("4th_f32" if is_4th else "f32") if use_float32 else ("4th_f64" if is_4th else "f64")
     if key not in _cuda_kernels:
-        if use_float32:
-            _cuda_kernels[key] = cp.RawKernel(_WAVE_CUDA_SRC_F32, "wave_step_f32")
+        if is_4th:
+            src, name = (_WAVE_CUDA_4TH_SRC_F32, "wave_step_4th_f32") if use_float32 \
+                else (_WAVE_CUDA_4TH_SRC_F64, "wave_step_4th_f64")
         else:
-            _cuda_kernels[key] = cp.RawKernel(_WAVE_CUDA_SRC_F64, "wave_step_f64")
+            src, name = (_WAVE_CUDA_SRC_F32, "wave_step_f32") if use_float32 \
+                else (_WAVE_CUDA_SRC_F64, "wave_step_f64")
+        _cuda_kernels[key] = cp.RawKernel(src, name)
     return _cuda_kernels[key]
 
 
@@ -826,6 +1188,8 @@ def _run_wave_cupy_fused_backend(
     cfg: PressureCASimConfig,
     static_pressure: np.ndarray,
     sound_speed: np.ndarray,
+    frame_sink: _FrameSink | None = None,
+    progress_fn=None,
 ):
     if not CUPY_AVAILABLE:
         raise RuntimeError("CuPy backend requested but cupy is not available.")
@@ -833,7 +1197,7 @@ def _run_wave_cupy_fused_backend(
 
     dtype_np = _sim_dtype(cfg)
     dtype_cp = cp.float32 if dtype_np == np.float32 else cp.float64
-    kernel = _get_cuda_wave_kernel(cfg.use_float32)
+    kernel = _get_cuda_wave_kernel(cfg.use_float32, cfg.stencil_order)
 
     total_cells = cfg.ny * cfg.nx
     block = 256
@@ -856,8 +1220,10 @@ def _run_wave_cupy_fused_backend(
     left_r = cp.asarray(bnd["left"], dtype=dtype_cp)
     right_r = cp.asarray(bnd["right"], dtype=dtype_cp)
 
-    frames_extra: List[np.ndarray] = []
+    use_sink = frame_sink is not None
+    frames_extra: List[np.ndarray] = [] if not use_sink else []
     source_trace = np.zeros(cfg.steps, dtype=dtype_np)
+    progress_interval = max(1, cfg.steps // 200)
 
     ny_i = np.int32(cfg.ny)
     nx_i = np.int32(cfg.nx)
@@ -880,7 +1246,17 @@ def _run_wave_cupy_fused_backend(
 
         p_prev, p, p_next = p, p_next, p_prev
         if step % max(1, cfg.frame_stride) == 0:
-            frames_extra.append(cp.asnumpy(p))
+            frame_np = cp.asnumpy(p)
+            if use_sink:
+                frame_sink.append(frame_np)
+            else:
+                frames_extra.append(frame_np)
+
+        if progress_fn and step % progress_interval == 0:
+            progress_fn(step, cfg.steps)
+
+    if progress_fn:
+        progress_fn(cfg.steps, cfg.steps)
 
     cp.cuda.Stream.null.synchronize()
     p_np = cp.asnumpy(p)
@@ -892,7 +1268,7 @@ def _run_wave_cupy_fused_backend(
         "sound_speed": sound_speed.astype(dtype_np, copy=False),
         "final_extra_pressure": p_np,
         "final_total_pressure": static_pressure.astype(dtype_np, copy=False) + p_np,
-        "frames_extra": frames_extra,
+        "frames_extra": frame_sink.frames if use_sink else frames_extra,
         "source_trace_extra": source_trace,
     }
 
@@ -901,6 +1277,8 @@ def _run_wave_cupy_backend(
     cfg: PressureCASimConfig,
     static_pressure: np.ndarray,
     sound_speed: np.ndarray,
+    frame_sink: _FrameSink | None = None,
+    progress_fn=None,
 ):
     if not CUPY_AVAILABLE:
         raise RuntimeError("CuPy backend requested but cupy is not available.")
@@ -921,8 +1299,10 @@ def _run_wave_cupy_backend(
     left_reflect = cp.asarray(boundary_profiles["left"], dtype=dtype_cp)
     right_reflect = cp.asarray(boundary_profiles["right"], dtype=dtype_cp)
 
-    frames_extra: List[np.ndarray] = []
+    use_sink = frame_sink is not None
+    frames_extra: List[np.ndarray] = [] if not use_sink else []
     source_trace = np.zeros(cfg.steps, dtype=dtype_np)
+    progress_interval = max(1, cfg.steps // 200)
 
     for step in range(cfg.steps):
         t = step * cfg.dt
@@ -949,7 +1329,17 @@ def _run_wave_cupy_backend(
 
         p_prev, p = p, p_next
         if step % max(1, cfg.frame_stride) == 0:
-            frames_extra.append(cp.asnumpy(p))
+            frame_np = cp.asnumpy(p)
+            if use_sink:
+                frame_sink.append(frame_np)
+            else:
+                frames_extra.append(frame_np)
+
+        if progress_fn and step % progress_interval == 0:
+            progress_fn(step, cfg.steps)
+
+    if progress_fn:
+        progress_fn(cfg.steps, cfg.steps)
 
     cp.cuda.Stream.null.synchronize()
     p_np = cp.asnumpy(p)
@@ -959,7 +1349,7 @@ def _run_wave_cupy_backend(
         "sound_speed": sound_speed.astype(dtype_np, copy=False),
         "final_extra_pressure": p_np,
         "final_total_pressure": static_pressure.astype(dtype_np, copy=False) + p_np,
-        "frames_extra": frames_extra,
+        "frames_extra": frame_sink.frames if use_sink else frames_extra,
         "source_trace_extra": source_trace,
     }
 
@@ -1030,7 +1420,7 @@ class WaveStepper:
         self._step_fn = self._step_numpy
 
     def _init_numba(self, bnd):
-        kernel = _get_numba_wave_step()
+        kernel = _get_numba_wave_step(self.cfg.stencil_order)
         if kernel is None:
             raise RuntimeError("Numba kernel compile failed")
         self._init_numpy(bnd)
@@ -1052,7 +1442,7 @@ class WaveStepper:
         dt_np = self._dtype
         dt_cp = cp.float32 if dt_np == np.float32 else cp.float64
         self._dt_cp = dt_cp
-        self._gpu_kernel = _get_cuda_wave_kernel(self.cfg.use_float32)
+        self._gpu_kernel = _get_cuda_wave_kernel(self.cfg.use_float32, self.cfg.stencil_order)
         self._gpu_bnd_kernel = _get_cuda_boundary_kernel(self.cfg.use_float32)
         ny, nx = self.cfg.ny, self.cfg.nx
         self._gpu_p_prev = cp.zeros((ny, nx), dtype=dt_cp)
@@ -1089,6 +1479,8 @@ class WaveStepper:
         p, p_prev = self._p, self._p_prev
 
         p_next = np.zeros_like(p)
+
+        # 2nd-order Laplacian for the full interior ring [1:-1, 1:-1]
         lap = (
             (p[1:-1, 2:] - dt(2.0) * p[1:-1, 1:-1] + p[1:-1, :-2]) * self._inv_dx2
             + (p[2:, 1:-1] - dt(2.0) * p[1:-1, 1:-1] + p[:-2, 1:-1]) * self._inv_dy2
@@ -1098,6 +1490,21 @@ class WaveStepper:
             - (dt(1.0) - self._sigma_dt) * p_prev[1:-1, 1:-1]
             + self._c2dt2[1:-1, 1:-1] * lap
         )
+
+        if cfg.stencil_order >= 4 and cfg.ny > 4 and cfg.nx > 4:
+            inv12 = dt(1.0 / 12.0)
+            lap4 = (
+                (-p[2:-2, 4:] + dt(16.0) * p[2:-2, 3:-1] - dt(30.0) * p[2:-2, 2:-2]
+                 + dt(16.0) * p[2:-2, 1:-3] - p[2:-2, :-4]) * self._inv_dx2 * inv12
+                + (-p[4:, 2:-2] + dt(16.0) * p[3:-1, 2:-2] - dt(30.0) * p[2:-2, 2:-2]
+                   + dt(16.0) * p[1:-3, 2:-2] - p[:-4, 2:-2]) * self._inv_dy2 * inv12
+            )
+            p_next[2:-2, 2:-2] = (
+                (dt(2.0) - self._sigma_dt) * p[2:-2, 2:-2]
+                - (dt(1.0) - self._sigma_dt) * p_prev[2:-2, 2:-2]
+                + self._c2dt2[2:-2, 2:-2] * lap4
+            )
+
         p_next[0, :] = self._top_r * p_next[1, :]
         p_next[-1, :] = self._bot_r * p_next[-2, :]
         p_next[:, 0] = self._left_r * p_next[:, 1]
@@ -1332,17 +1739,32 @@ class WaveStepper:
                 self._p_next_buf.fill(0)
 
 
-def run_pressure_transfer_ca(cfg: PressureCASimConfig):
+def run_pressure_transfer_ca(cfg: PressureCASimConfig, progress_fn=None,
+                              frame_dir: str | None = None):
     """Run the full simulation and return results as a dict.
 
     This is the batch entry point used by ``run_experiment.py``.
     It runs all ``cfg.steps`` timesteps, collects sampled frames,
     and returns everything needed for plotting and GIF generation.
 
+    Frames are streamed to disk via memmap when the estimated total
+    would exceed ~4 GB of RAM, so even huge grids won't OOM.
+
+    Parameters
+    ----------
+    progress_fn : callable(step, total) or None
+        If provided, called periodically with the current step number
+        and total steps so the caller can display progress.
+    frame_dir : str or None
+        Directory for the disk-backed frame cache.  When *None* the
+        system temp directory is used.  Pass the experiment output
+        directory so large frame files live alongside your results.
+
     Returns a dict with keys:
         backend_used, static_pressure, sound_speed,
         final_extra_pressure, final_total_pressure,
-        frames_extra, source_trace_extra.
+        frames_extra, source_trace_extra,
+        _frame_sink (internal — call .cleanup() when done).
     """
     if cfg.nx <= 2 or cfg.ny <= 2:
         raise ValueError("Grid must be at least 3x3.")
@@ -1360,6 +1782,17 @@ def run_pressure_transfer_ca(cfg: PressureCASimConfig):
     static_pressure = build_static_pressure(cfg)
     sound_speed = build_sound_speed_grid(cfg)
 
+    n_frames_est = cfg.steps // max(1, cfg.frame_stride) + 1
+    dtype = np.float32 if cfg.use_float32 else np.float64
+    sink = _FrameSink(cfg.ny, cfg.nx, n_frames_est, dtype=dtype,
+                      disk_dir=frame_dir)
+    if sink.ds > 1:
+        print(f"  Frames downsampled {sink.ds}x for storage: "
+              f"{cfg.nx}x{cfg.ny} -> {sink.nx}x{sink.ny}")
+    est_gb = n_frames_est * sink._frame_nbytes / (1024**3)
+    if sink._mode == "disk":
+        print(f"  Frames will stream to disk ({est_gb:.1f} GB): {sink.disk_path}")
+
     requested = str(cfg.backend).strip().lower()
     if requested not in ("auto", "cpu", "gpu"):
         raise ValueError("backend must be one of: auto, cpu, gpu")
@@ -1367,47 +1800,52 @@ def run_pressure_transfer_ca(cfg: PressureCASimConfig):
     if model not in ("wave", "transfer"):
         raise ValueError("propagation_model must be one of: wave, transfer")
 
+    def _wrap(result):
+        result["cfg"] = cfg
+        result["_frame_sink"] = sink
+        sink.write_meta()
+        return result
+
     if model == "wave":
         _check_wave_cfl(cfg, sound_speed)
-        # Priority: GPU (fused CUDA) → GPU (CuPy array) → Numba CPU → NumPy CPU.
         if requested in ("auto", "gpu"):
             try:
-                result = _run_wave_cupy_fused_backend(cfg, static_pressure, sound_speed)
-                result["cfg"] = cfg
-                return result
+                return _wrap(_run_wave_cupy_fused_backend(
+                    cfg, static_pressure, sound_speed,
+                    frame_sink=sink, progress_fn=progress_fn))
             except Exception:
                 pass
             try:
-                result = _run_wave_cupy_backend(cfg, static_pressure, sound_speed)
-                result["cfg"] = cfg
-                return result
+                return _wrap(_run_wave_cupy_backend(
+                    cfg, static_pressure, sound_speed,
+                    frame_sink=sink, progress_fn=progress_fn))
             except Exception:
                 if requested == "gpu":
                     raise
         if requested in ("auto", "cpu"):
             if NUMBA_AVAILABLE:
                 try:
-                    result = _run_wave_numba_backend(cfg, static_pressure, sound_speed)
-                    result["cfg"] = cfg
-                    return result
+                    return _wrap(_run_wave_numba_backend(
+                        cfg, static_pressure, sound_speed,
+                        frame_sink=sink, progress_fn=progress_fn))
                 except Exception:
                     pass
-        result = _run_wave_numpy_backend(cfg, static_pressure, sound_speed)
-        result["cfg"] = cfg
-        return result
+        return _wrap(_run_wave_numpy_backend(
+            cfg, static_pressure, sound_speed,
+            frame_sink=sink, progress_fn=progress_fn))
 
     tables = _precompute_transfer_tables(cfg, sound_speed)
     if requested in ("auto", "gpu"):
         try:
-            result = _run_cupy_backend(cfg, static_pressure, sound_speed, tables)
-            result["cfg"] = cfg
-            return result
+            return _wrap(_run_cupy_backend(
+                cfg, static_pressure, sound_speed, tables,
+                frame_sink=sink, progress_fn=progress_fn))
         except Exception:
             if requested == "gpu":
                 raise
-    result = _run_numpy_backend(cfg, static_pressure, sound_speed, tables)
-    result["cfg"] = cfg
-    return result
+    return _wrap(_run_numpy_backend(
+        cfg, static_pressure, sound_speed, tables,
+        frame_sink=sink, progress_fn=progress_fn))
 
 
 def _pick_grid_stride(n_cells: int, approx_pixels: float,

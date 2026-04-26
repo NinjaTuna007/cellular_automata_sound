@@ -44,10 +44,15 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+import time as _time
+
+from tqdm import tqdm
 
 from pressure_transfer_ca import (
     PressureCASimConfig,
@@ -96,6 +101,8 @@ def parse_args():
     over.add_argument("--frame-stride", type=int, default=None)
     over.add_argument("--gif-fps", type=int, default=None)
     over.add_argument("--no-gif", action="store_true", default=None)
+    over.add_argument("--no-frames", action="store_true", default=None,
+                       help="Skip saving frame data for GUI replay")
     over.add_argument("--no-grid", action="store_true", default=None,
                        help="Hide cell boundary grid lines")
     over.add_argument("--tag", type=str, default=None)
@@ -143,6 +150,7 @@ def config_to_sim(cfg: dict, args) -> PressureCASimConfig:
     ssp_speeds = tuple(get(cfg, "ssp", "speeds", default=[1535, 1518, 1492, 1503, 1520]))
     freq = args.freq_hz if args.freq_hz is not None else get(cfg, "source", "frequency", default=24000)
 
+    stencil_order = get(cfg, "grid", "stencil_order", default=2)
     grid = auto_resolve_grid(
         frequency_hz=freq,
         c_min=min(ssp_speeds),
@@ -154,7 +162,8 @@ def config_to_sim(cfg: dict, args) -> PressureCASimConfig:
         dt=args.dt if args.dt is not None else get(cfg, "time", "dt", default=0),
         nx=args.nx or get(cfg, "grid", "nx", default=0),
         ny=args.ny or get(cfg, "grid", "ny", default=0),
-        cells_per_wavelength=get(cfg, "grid", "cells_per_wavelength", default=10),
+        cells_per_wavelength=get(cfg, "grid", "cells_per_wavelength", default=0),
+        stencil_order=stencil_order,
     )
     nx, ny = grid["nx"], grid["ny"]
     dx, dy, dt = grid["dx"], grid["dy"], grid["dt"]
@@ -194,6 +203,7 @@ def config_to_sim(cfg: dict, args) -> PressureCASimConfig:
     return PressureCASimConfig(
         nx=nx, ny=ny, dx=dx, dy=dy, dt=dt, steps=steps,
         propagation_model=model,
+        stencil_order=stencil_order,
         transfer_fraction=get(cfg, "transfer", "fraction", default=0.42),
         damping=get(cfg, "transfer", "damping", default=0.002),
         diagonal_interface_scale=get(cfg, "transfer", "diagonal_interface_scale", default=0.35),
@@ -223,21 +233,53 @@ def config_to_sim(cfg: dict, args) -> PressureCASimConfig:
 
 def build_experiment_dirname(sim_cfg: PressureCASimConfig, tag: str) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    world_x = sim_cfg.nx * sim_cfg.dx
-    world_y = sim_cfg.ny * sim_cfg.dy
-    parts = [
-        ts,
-        sim_cfg.propagation_model,
-        f"{world_x:.0f}x{world_y:.0f}m",
-        f"dt{sim_cfg.dt:.6f}".rstrip("0").rstrip("."),
-        f"{sim_cfg.steps}steps",
-        f"{sim_cfg.source_frequency_hz:.0f}Hz",
-    ]
-    if sim_cfg.boundary_reflect_left == 0.0 and sim_cfg.boundary_reflect_right == 0.0:
-        parts.append("no_side_refl")
     if tag:
-        parts.append(tag)
-    return "_".join(parts)
+        return f"{ts}_{tag}"
+    return ts
+
+
+MAX_FRAME_DIM = 2048  # downsample frames if either dimension exceeds this
+
+
+def _save_frames(frames_raw: list, sim_cfg: PressureCASimConfig, exp_dir: Path):
+    """Compress and save simulation frames for later GUI replay.
+
+    Large grids are spatially downsampled so the .npz stays manageable.
+    """
+    ny, nx = frames_raw[0].shape
+    ds = 1  # downsample factor
+    while ny // ds > MAX_FRAME_DIM or nx // ds > MAX_FRAME_DIM:
+        ds += 1
+
+    if ds > 1:
+        print(f"Downsampling frames {ds}× for storage ({nx}×{ny} → {nx // ds}×{ny // ds})")
+        down = []
+        for f in frames_raw:
+            trimmed = f[:ny - ny % ds, :nx - nx % ds]
+            down.append(trimmed.reshape(trimmed.shape[0] // ds, ds,
+                                        trimmed.shape[1] // ds, ds).mean(axis=(1, 3)))
+        frames_arr = np.array(down, dtype=np.float32)
+    else:
+        frames_arr = np.array(frames_raw, dtype=np.float32)
+
+    frame_times = np.arange(len(frames_arr)) * sim_cfg.dt * max(1, sim_cfg.frame_stride)
+    npz_path = exp_dir / "frames.npz"
+    np.savez_compressed(
+        npz_path,
+        frames=frames_arr,
+        frame_times=frame_times,
+        dt=sim_cfg.dt,
+        frame_stride=sim_cfg.frame_stride,
+        nx=nx, ny=ny,
+        dx=sim_cfg.dx, dy=sim_cfg.dy,
+        ds_factor=ds,
+        source_frequency_hz=sim_cfg.source_frequency_hz,
+        stencil_order=sim_cfg.stencil_order,
+        source_ix=sim_cfg.source_ix,
+        source_iy=sim_cfg.source_iy,
+    )
+    mb = npz_path.stat().st_size / (1024 * 1024)
+    print(f"Saved          : {npz_path.name} ({len(frames_arr)} frames, {mb:.1f} MB)")
 
 
 def main():
@@ -277,13 +319,29 @@ def main():
           f"bottom={sim_cfg.boundary_reflect_bottom}, "
           f"left={sim_cfg.boundary_reflect_left}, "
           f"right={sim_cfg.boundary_reflect_right}")
-    print("Running simulation...")
 
-    result = run_pressure_transfer_ca(sim_cfg)
+    n_frames_est = sim_cfg.steps // max(1, sim_cfg.frame_stride) + 1
+    print(f"Frames         : ~{n_frames_est} (stride {sim_cfg.frame_stride})")
+
+    print("Running simulation...")
+    pbar = tqdm(total=sim_cfg.steps, unit="step", dynamic_ncols=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+
+    def _tqdm_progress(step: int, total: int):
+        pbar.update(step - pbar.n)
+
+    t0 = _time.monotonic()
+    result = run_pressure_transfer_ca(sim_cfg, progress_fn=_tqdm_progress,
+                                       frame_dir=str(exp_dir))
+    elapsed = _time.monotonic() - t0
+    pbar.close()
     backend_used = result.get("backend_used", "unknown")
     print(f"Backend        : {backend_used}")
+    print(f"Wall time      : {elapsed:.1f} s "
+          f"({sim_cfg.steps / max(0.01, elapsed):.0f} steps/s)")
 
     show_grid = not no_grid
+    no_frames = args.no_frames if args.no_frames else get(cfg, "output", "no_frames", default=False)
 
     fig = plot_static_and_final(result, show_grid=show_grid)
     png_path = exp_dir / "summary.png"
@@ -298,6 +356,17 @@ def main():
         save_gif_parallel(result, str(gif_path), fps=gif_fps, dpi=gif_dpi,
                           show_time=True, show_grid=show_grid)
         print(f"Saved          : {gif_path.name}")
+
+    # ── Save frame data for GUI replay ──
+    if not no_frames:
+        frames_raw = result.get("frames_extra", [])
+        if frames_raw:
+            _save_frames(frames_raw, sim_cfg, exp_dir)
+
+    # Clean up temp memmap file if the frame sink used disk
+    sink = result.get("_frame_sink")
+    if sink is not None:
+        sink.cleanup()
 
     print(f"\nDone. Results in:\n  {exp_dir}")
 

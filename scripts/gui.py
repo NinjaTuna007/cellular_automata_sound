@@ -72,6 +72,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from pressure_transfer_ca import (
     PressureCASimConfig,
     WaveStepper,
+    _DiskFrameReader,
     auto_resolve_grid,
 )
 
@@ -113,6 +114,7 @@ def config_to_sim(cfg: dict) -> PressureCASimConfig:
     ssp_speeds = tuple(_get(cfg, "ssp", "speeds", default=[1535, 1518, 1492, 1503, 1520]))
     freq = _get(cfg, "source", "frequency", default=24000)
 
+    stencil_order = _get(cfg, "grid", "stencil_order", default=2)
     grid = auto_resolve_grid(
         frequency_hz=freq,
         c_min=min(ssp_speeds),
@@ -124,7 +126,8 @@ def config_to_sim(cfg: dict) -> PressureCASimConfig:
         dt=_get(cfg, "time", "dt", default=0),
         nx=_get(cfg, "grid", "nx", default=0),
         ny=_get(cfg, "grid", "ny", default=0),
-        cells_per_wavelength=_get(cfg, "grid", "cells_per_wavelength", default=10),
+        cells_per_wavelength=_get(cfg, "grid", "cells_per_wavelength", default=0),
+        stencil_order=stencil_order,
     )
     nx, ny = grid["nx"], grid["ny"]
     dx, dy, dt = grid["dx"], grid["dy"], grid["dt"]
@@ -147,6 +150,7 @@ def config_to_sim(cfg: dict) -> PressureCASimConfig:
         nx=nx, ny=ny, dx=dx, dy=dy, dt=dt, steps=steps,
         propagation_model=_get(cfg, "model", "type", default="wave"),
         wave_absorption_per_s=_get(cfg, "model", "absorption", default=0.05),
+        stencil_order=stencil_order,
         boundary_reflect_top=_get(cfg, "boundary", "top", default=-0.98),
         boundary_reflect_bottom=_get(cfg, "boundary", "bottom", default=0.99),
         boundary_reflect_left=_get(cfg, "boundary", "left", default=0.99),
@@ -349,12 +353,38 @@ GRID_COLOR = (40, 40, 40, 60)
 OPEN_BOUNDARY_COLOR = (255, 80, 80)
 BOUNDARY_COLOR = (200, 200, 200)
 PANEL_BG = (30, 30, 30)
+AXIS_COLOR = (200, 200, 200, 200)
+AXIS_BG = (0, 0, 0, 140)
+AXIS_MARGIN_LEFT = 48
+AXIS_MARGIN_BOTTOM = 20
+TICK_LEN = 5
 HUD_H = 32
 
 
-def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
+def _nice_tick_step(range_val, max_ticks=10):
+    """Pick a human-friendly tick step for a given value range."""
+    if range_val <= 0:
+        return 1.0
+    rough = range_val / max_ticks
+    mag = 10 ** int(np.floor(np.log10(rough)))
+    residual = rough / mag
+    if residual <= 1.0:
+        return mag
+    elif residual <= 2.0:
+        return 2 * mag
+    elif residual <= 5.0:
+        return 5 * mag
+    return 10 * mag
+
+
+def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live",
+            preloaded_frames: list | None = None,
+            replay_meta: dict | None = None):
     pygame.init()
-    pygame.display.set_caption("Pressure CA — Interactive Viewer")
+    caption = "Pressure CA — Interactive Viewer"
+    if replay_meta:
+        caption = f"Replay: {replay_meta['experiment']}"
+    pygame.display.set_caption(caption)
 
     # Initial window size: fit the grid aspect ratio into screen
     info = pygame.display.Info()
@@ -372,9 +402,15 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
     font = pygame.font.SysFont("monospace", 13)
     small_font = pygame.font.SysFont("monospace", 11)
 
-    print(f"Initializing WaveStepper (backend={sim_cfg.backend})...")
-    stepper = WaveStepper(sim_cfg)
-    print(f"Backend: {stepper.backend_name}")
+    stepper = None
+    backend_label = "replay"
+    if preloaded_frames is not None:
+        print(f"Replay mode: {len(preloaded_frames)} frames loaded")
+    else:
+        print(f"Initializing WaveStepper (backend={sim_cfg.backend})...")
+        stepper = WaveStepper(sim_cfg)
+        backend_label = stepper.backend_name
+        print(f"Backend: {backend_label}")
     print(f"Grid: {sim_cfg.nx}x{sim_cfg.ny}")
 
     # ── Layout state (recalculated on resize) ──
@@ -402,30 +438,158 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
             self.cell_px_y = self.grid_h / sim_cfg.ny
             self._grid_overlay = None
 
-        def grid_overlay(self) -> pygame.Surface | None:
-            """Lazy-built semi-transparent grid line overlay."""
-            cpx = min(self.cell_px_x, self.cell_px_y)
-            if cpx < 8:
+        def grid_overlay(self, viewport) -> pygame.Surface | None:
+            """Build a grid overlay for the current viewport.
+
+            Uses the viewport's visible cell range and draw_rect so grid
+            lines track actual cell boundaries when zoomed/panned.
+            """
+            ox, oy, dw, dh = viewport.draw_rect()
+            n_vis_x = viewport.world_w / sim_cfg.dx
+            n_vis_y = viewport.world_h / sim_cfg.dy
+            cpx = dw / max(1, n_vis_x)
+            cpy = dh / max(1, n_vis_y)
+            cell_px = min(cpx, cpy)
+            if cell_px < 8:
                 return None
             if self._grid_overlay is not None:
                 return self._grid_overlay
             stride = 1
             for s in (1, 2, 5, 10, 20, 50):
-                if cpx * s >= 8:
+                if cell_px * s >= 8:
                     stride = s
                     break
             surf = pygame.Surface((self.grid_w, self.grid_h), pygame.SRCALPHA)
             gc = GRID_COLOR
-            for ix in range(0, sim_cfg.nx + 1, stride):
-                x = int(ix * self.cell_px_x)
-                pygame.draw.line(surf, gc, (x, 0), (x, self.grid_h - 1), 1)
-            for iy in range(0, sim_cfg.ny + 1, stride):
-                y = int(iy * self.cell_px_y)
-                pygame.draw.line(surf, gc, (0, y), (self.grid_w - 1, y), 1)
+            ix0 = int(viewport.world_x0 / sim_cfg.dx)
+            iy0 = int(viewport.world_y0 / sim_cfg.dy)
+            ix_start = ix0 - (ix0 % stride)
+            iy_start = iy0 - (iy0 % stride)
+            ix_end = min(sim_cfg.nx, int(np.ceil((viewport.world_x0 + viewport.world_w) / sim_cfg.dx)) + 1)
+            iy_end = min(sim_cfg.ny, int(np.ceil((viewport.world_y0 + viewport.world_h) / sim_cfg.dy)) + 1)
+            for ix in range(ix_start, ix_end + 1, stride):
+                wx = ix * sim_cfg.dx
+                px, _ = viewport.world_to_pixel(wx, 0)
+                ipx = int(px)
+                if 0 <= ipx < self.grid_w:
+                    pygame.draw.line(surf, gc, (ipx, 0), (ipx, self.grid_h - 1), 1)
+            for iy in range(iy_start, iy_end + 1, stride):
+                wy = iy * sim_cfg.dy
+                _, py = viewport.world_to_pixel(0, wy)
+                ipy = int(py)
+                if 0 <= ipy < self.grid_h:
+                    pygame.draw.line(surf, gc, (0, ipy), (self.grid_w - 1, ipy), 1)
             self._grid_overlay = surf
             return surf
 
     layout = Layout()
+
+    # ── Viewport (zoom & pan in world coordinates) ──
+
+    class Viewport:
+        """Tracks which rectangle of the world (in metres) is visible,
+        with uniform scaling so the physical aspect ratio is preserved."""
+        def __init__(self):
+            self.reset()
+
+        def reset(self):
+            self.world_x0 = 0.0
+            self.world_y0 = 0.0
+            self.world_w = sim_cfg.nx * sim_cfg.dx
+            self.world_h = sim_cfg.ny * sim_cfg.dy
+
+        # -- draw rectangle: the pixel sub-rect within the grid area that
+        #    preserves the physical aspect ratio (letterbox / pillarbox) --
+
+        def draw_rect(self):
+            """Return (ox, oy, dw, dh) — the pixel rectangle inside the grid
+            area that maps to the current world window with uniform scaling."""
+            gw, gh = layout.grid_w, layout.grid_h
+            if self.world_w <= 0 or self.world_h <= 0:
+                return 0, 0, gw, gh
+            world_ar = self.world_w / self.world_h
+            screen_ar = gw / gh
+            if world_ar > screen_ar:
+                dw = gw
+                dh = int(gw / world_ar)
+                ox = 0
+                oy = (gh - dh) // 2
+            else:
+                dh = gh
+                dw = int(gh * world_ar)
+                ox = (gw - dw) // 2
+                oy = 0
+            return ox, oy, max(1, dw), max(1, dh)
+
+        def zoom(self, factor, px, py):
+            """Zoom by *factor* centred on screen pixel (px, py)."""
+            wx, wy = self.pixel_to_world(px, py)
+            full_w = sim_cfg.nx * sim_cfg.dx
+            full_h = sim_cfg.ny * sim_cfg.dy
+            new_w = max(sim_cfg.dx * 4, min(full_w, self.world_w / factor))
+            new_h = max(sim_cfg.dy * 4, min(full_h, self.world_h / factor))
+            # Lock aspect ratio to the world window's current ratio
+            ar = self.world_w / self.world_h if self.world_h > 0 else 1.0
+            if new_w / new_h > ar:
+                new_h = new_w / ar
+            else:
+                new_w = new_h * ar
+            new_w = min(new_w, full_w)
+            new_h = min(new_h, full_h)
+            ox, oy, dw, dh = self.draw_rect()
+            frac_x = (px - ox) / dw if dw else 0.5
+            frac_y = (py - oy) / dh if dh else 0.5
+            frac_x = max(0.0, min(1.0, frac_x))
+            frac_y = max(0.0, min(1.0, frac_y))
+            self.world_x0 = wx - frac_x * new_w
+            self.world_y0 = wy - frac_y * new_h
+            self.world_w = new_w
+            self.world_h = new_h
+            self._clamp()
+            layout._grid_overlay = None
+
+        def pan(self, dx_px, dy_px):
+            """Pan by a screen-pixel delta."""
+            _, _, dw, dh = self.draw_rect()
+            self.world_x0 -= dx_px / dw * self.world_w if dw else 0
+            self.world_y0 -= dy_px / dh * self.world_h if dh else 0
+            self._clamp()
+            layout._grid_overlay = None
+
+        def _clamp(self):
+            full_w = sim_cfg.nx * sim_cfg.dx
+            full_h = sim_cfg.ny * sim_cfg.dy
+            self.world_x0 = max(0.0, min(self.world_x0, full_w - self.world_w))
+            self.world_y0 = max(0.0, min(self.world_y0, full_h - self.world_h))
+
+        def world_to_pixel(self, wx, wy):
+            ox, oy, dw, dh = self.draw_rect()
+            px = ox + (wx - self.world_x0) / self.world_w * dw
+            py = oy + (wy - self.world_y0) / self.world_h * dh
+            return px, py
+
+        def pixel_to_world(self, px, py):
+            ox, oy, dw, dh = self.draw_rect()
+            wx = self.world_x0 + ((px - ox) / dw) * self.world_w
+            wy = self.world_y0 + ((py - oy) / dh) * self.world_h
+            return wx, wy
+
+        def cell_slice(self):
+            """Return (ix0, iy0, ix1, iy1) — the cell index range visible."""
+            ix0 = max(0, int(self.world_x0 / sim_cfg.dx))
+            iy0 = max(0, int(self.world_y0 / sim_cfg.dy))
+            ix1 = min(sim_cfg.nx, int(np.ceil((self.world_x0 + self.world_w) / sim_cfg.dx)))
+            iy1 = min(sim_cfg.ny, int(np.ceil((self.world_y0 + self.world_h) / sim_cfg.dy)))
+            return ix0, iy0, ix1, iy1
+
+        @property
+        def zoom_level(self):
+            full_w = sim_cfg.nx * sim_cfg.dx
+            return full_w / self.world_w
+
+    vp = Viewport()
+    panning = False
+    pan_last = (0, 0)
 
     # ── Simulation / display state ──
 
@@ -465,15 +629,22 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
     def pixel_to_cell(mx, my):
         if mx >= layout.grid_w or my >= layout.grid_h:
             return None
-        ix = int(mx / layout.cell_px_x)
-        iy = int(my / layout.cell_px_y)
+        wx, wy = vp.pixel_to_world(mx, my)
+        ix = int(wx / sim_cfg.dx)
+        iy = int(wy / sim_cfg.dy)
         if 0 <= ix < sim_cfg.nx and 0 <= iy < sim_cfg.ny:
             return ix, iy
         return None
 
     def cell_to_pixel(ix, iy):
-        return (int((ix + 0.5) * layout.cell_px_x),
-                int((iy + 0.5) * layout.cell_px_y))
+        wx = (ix + 0.5) * sim_cfg.dx
+        wy = (iy + 0.5) * sim_cfg.dy
+        px, py = vp.world_to_pixel(wx, wy)
+        return int(px), int(py)
+
+    def fmt_pos(ix, iy):
+        """Format cell position as physical coordinates."""
+        return f"({ix * sim_cfg.dx:.1f}, {iy * sim_cfg.dy:.1f})m"
 
     def add_probe(ix, iy):
         nonlocal color_counter, probe_dirty
@@ -487,12 +658,16 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
         color_counter += 1
         if mode == "playback":
             for i, fld in enumerate(frame_history):
-                p.record(i * sim_cfg.dt, float(fld[iy, ix]))
+                if replay_meta and "frame_times" in replay_meta and i < len(replay_meta["frame_times"]):
+                    t_frame = float(replay_meta["frame_times"][i])
+                else:
+                    t_frame = i * sim_cfg.dt
+                p.record(t_frame, float(fld[iy, ix]))
         probes.append(p)
         probe_dirty = True
         if not layout.panel_visible:
             toggle_panel(True)
-        print(f"Probe added at ({ix}, {iy})")
+        print(f"Probe added at {fmt_pos(ix, iy)}")
 
     # legend_rects: list of (pygame.Rect in screen coords, probe index)
     legend_rects: list[tuple[pygame.Rect, int]] = []
@@ -501,7 +676,7 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
         nonlocal probe_dirty
         removed = probes.pop(idx)
         probe_dirty = True
-        print(f"Removed probe ({removed.ix}, {removed.iy})")
+        print(f"Removed probe {fmt_pos(removed.ix, removed.iy)}")
         if not probes:
             toggle_panel(False)
 
@@ -524,50 +699,142 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
 
     # ── Rendering ──
 
+    def _downsample_field(field, target_w, target_h):
+        """Downsample a (ny, nx) array to roughly (target_h, target_w) via block mean."""
+        ny, nx = field.shape
+        if nx <= target_w and ny <= target_h:
+            return field
+        sy = max(1, ny // target_h)
+        sx = max(1, nx // target_w)
+        # Trim to exact multiple of block size, then reshape + mean
+        trimmed = field[:ny - ny % sy, :nx - nx % sx]
+        return trimmed.reshape(trimmed.shape[0] // sy, sy,
+                               trimmed.shape[1] // sx, sx).mean(axis=(1, 3))
+
     def render_field(p_field):
-        native_surf = field_to_surface(p_field, vmax_display)
         tw, th = layout.grid_w, layout.grid_h
-        # smoothscale when downscaling (cells < pixels) to avoid moire;
-        # regular scale when upscaling (cells > pixels) for sharp edges.
-        nw, nh = native_surf.get_size()
-        if nw > tw or nh > th:
-            scaled = pygame.transform.smoothscale(native_surf, (tw, th))
+        # Crop to the viewport's visible cell range
+        ix0, iy0, ix1, iy1 = vp.cell_slice()
+        visible = p_field[iy0:iy1, ix0:ix1]
+        ds = _downsample_field(visible, tw, th)
+        surf = field_to_surface(ds, vmax_display)
+        sw, sh = surf.get_size()
+        if sw > tw or sh > th:
+            scaled = pygame.transform.smoothscale(surf, (tw, th))
+        elif sw != tw or sh != th:
+            scaled = pygame.transform.scale(surf, (tw, th))
         else:
-            scaled = pygame.transform.scale(native_surf, (tw, th))
+            scaled = surf
         screen.blit(scaled, (0, 0))
 
-        overlay = layout.grid_overlay()
+        overlay = layout.grid_overlay(vp)
         if overlay:
             screen.blit(overlay, (0, 0))
 
-        # Boundaries
+        # Boundaries — only draw edges that are in the viewport
         lw = 3
         c = sim_cfg
+        gw, gh = layout.grid_w, layout.grid_h
         top_c = OPEN_BOUNDARY_COLOR if c.boundary_reflect_top == 0.0 else BOUNDARY_COLOR
         bot_c = OPEN_BOUNDARY_COLOR if c.boundary_reflect_bottom == 0.0 else BOUNDARY_COLOR
         lft_c = OPEN_BOUNDARY_COLOR if c.boundary_reflect_left == 0.0 else BOUNDARY_COLOR
         rgt_c = OPEN_BOUNDARY_COLOR if c.boundary_reflect_right == 0.0 else BOUNDARY_COLOR
-        gw, gh = layout.grid_w, layout.grid_h
-        pygame.draw.line(screen, top_c, (0, 0), (gw - 1, 0), lw)
-        pygame.draw.line(screen, bot_c, (0, gh - 1), (gw - 1, gh - 1), lw)
-        pygame.draw.line(screen, lft_c, (0, 0), (0, gh - 1), lw)
-        pygame.draw.line(screen, rgt_c, (gw - 1, 0), (gw - 1, gh - 1), lw)
+        full_w = sim_cfg.nx * sim_cfg.dx
+        full_h = sim_cfg.ny * sim_cfg.dy
+        _, top_py = vp.world_to_pixel(0, 0)
+        _, bot_py = vp.world_to_pixel(0, full_h)
+        lft_px, _ = vp.world_to_pixel(0, 0)
+        rgt_px, _ = vp.world_to_pixel(full_w, 0)
+        if 0 <= top_py <= gh:
+            pygame.draw.line(screen, top_c, (0, int(top_py)), (gw - 1, int(top_py)), lw)
+        if 0 <= bot_py <= gh:
+            pygame.draw.line(screen, bot_c, (0, int(bot_py)), (gw - 1, int(bot_py)), lw)
+        if 0 <= lft_px <= gw:
+            pygame.draw.line(screen, lft_c, (int(lft_px), 0), (int(lft_px), gh - 1), lw)
+        if 0 <= rgt_px <= gw:
+            pygame.draw.line(screen, rgt_c, (int(rgt_px), 0), (int(rgt_px), gh - 1), lw)
 
         # Source marker
         sx, sy = cell_to_pixel(sim_cfg.source_ix, sim_cfg.source_iy)
-        r = max(3, int(min(layout.cell_px_x, layout.cell_px_y) / 3))
-        pygame.draw.circle(screen, SOURCE_COLOR, (sx, sy), r)
-        pygame.draw.circle(screen, (255, 255, 255), (sx, sy), r, 1)
+        if 0 <= sx < gw and 0 <= sy < gh:
+            r = max(3, int(min(layout.cell_px_x, layout.cell_px_y) * vp.zoom_level / 3))
+            r = max(3, min(r, 20))
+            pygame.draw.circle(screen, SOURCE_COLOR, (sx, sy), r)
+            pygame.draw.circle(screen, (255, 255, 255), (sx, sy), r, 1)
 
         # Probe markers
         for p in probes:
             cx, cy = cell_to_pixel(p.ix, p.iy)
-            pr = max(4, int(min(layout.cell_px_x, layout.cell_px_y) / 2))
-            pygame.draw.circle(screen, p.color, (cx, cy), pr, 2)
-            label = small_font.render(f"({p.ix},{p.iy})", True, p.color)
-            lx = min(cx + pr + 2, gw - label.get_width() - 2)
-            ly = max(cy - label.get_height(), 2)
-            screen.blit(label, (lx, ly))
+            if 0 <= cx < gw and 0 <= cy < gh:
+                pr = max(4, int(min(layout.cell_px_x, layout.cell_px_y) * vp.zoom_level / 2))
+                pr = max(4, min(pr, 20))
+                pygame.draw.circle(screen, p.color, (cx, cy), pr, 2)
+                label = small_font.render(fmt_pos(p.ix, p.iy), True, p.color)
+                lx = min(cx + pr + 2, gw - label.get_width() - 2)
+                ly = max(cy - label.get_height(), 2)
+                screen.blit(label, (lx, ly))
+
+    def render_axes():
+        """Draw x/y coordinate axes with tick marks and labels (metres)."""
+        gw, gh = layout.grid_w, layout.grid_h
+        ax_font = small_font
+
+        # Semi-transparent background strips for readability
+        left_bg = pygame.Surface((AXIS_MARGIN_LEFT, gh), pygame.SRCALPHA)
+        left_bg.fill(AXIS_BG)
+        screen.blit(left_bg, (0, 0))
+        bot_bg = pygame.Surface((gw, AXIS_MARGIN_BOTTOM), pygame.SRCALPHA)
+        bot_bg.fill(AXIS_BG)
+        screen.blit(bot_bg, (0, gh - AXIS_MARGIN_BOTTOM))
+
+        # X-axis (bottom)
+        x_step = _nice_tick_step(vp.world_w, max_ticks=max(3, gw // 80))
+        x_start = np.ceil(vp.world_x0 / x_step) * x_step
+        x = x_start
+        while x <= vp.world_x0 + vp.world_w:
+            px, _ = vp.world_to_pixel(x, 0)
+            ipx = int(px)
+            if AXIS_MARGIN_LEFT <= ipx < gw:
+                ty = gh - AXIS_MARGIN_BOTTOM
+                pygame.draw.line(screen, AXIS_COLOR[:3], (ipx, ty), (ipx, ty + TICK_LEN), 1)
+                if x_step >= 1.0:
+                    lbl = f"{x:.0f}"
+                elif x_step >= 0.1:
+                    lbl = f"{x:.1f}"
+                else:
+                    lbl = f"{x:.2f}"
+                ts = ax_font.render(lbl, True, AXIS_COLOR[:3])
+                screen.blit(ts, (ipx - ts.get_width() // 2, ty + TICK_LEN + 1))
+            x += x_step
+
+        # Y-axis (left)
+        y_step = _nice_tick_step(vp.world_h, max_ticks=max(3, gh // 40))
+        y_start = np.ceil(vp.world_y0 / y_step) * y_step
+        y = y_start
+        while y <= vp.world_y0 + vp.world_h:
+            _, py = vp.world_to_pixel(0, y)
+            ipy = int(py)
+            if 0 <= ipy < gh - AXIS_MARGIN_BOTTOM:
+                pygame.draw.line(screen, AXIS_COLOR[:3],
+                                 (AXIS_MARGIN_LEFT - TICK_LEN, ipy),
+                                 (AXIS_MARGIN_LEFT, ipy), 1)
+                if y_step >= 1.0:
+                    lbl = f"{y:.0f}"
+                elif y_step >= 0.1:
+                    lbl = f"{y:.1f}"
+                else:
+                    lbl = f"{y:.2f}"
+                ts = ax_font.render(lbl, True, AXIS_COLOR[:3])
+                screen.blit(ts, (AXIS_MARGIN_LEFT - TICK_LEN - ts.get_width() - 2,
+                                 ipy - ts.get_height() // 2))
+            y += y_step
+
+        # Axis labels
+        x_label = ax_font.render("x (m)", True, AXIS_COLOR[:3])
+        screen.blit(x_label, (gw // 2 - x_label.get_width() // 2,
+                               gh - x_label.get_height()))
+        y_label = ax_font.render("y (m)", True, AXIS_COLOR[:3])
+        screen.blit(y_label, (2, 2))
 
     def render_panel():
         nonlocal probe_dirty
@@ -582,7 +849,7 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
         legend_rects.clear()
         legend_y = 4
         for i, p in enumerate(probes):
-            label_text = f"  \u25a0 ({p.ix},{p.iy}) d={p.iy * sim_cfg.dy:.0f}m  \u2715 "
+            label_text = f"  \u25a0 {fmt_pos(p.ix, p.iy)} d={p.iy * sim_cfg.dy:.1f}m  \u2715 "
             label_surf = small_font.render(label_text, True, p.color)
             lw = label_surf.get_width()
             lh = LEGEND_ROW_H
@@ -614,25 +881,43 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
         rect = pygame.Rect(0, layout.grid_h, layout.win_w, HUD_H)
         pygame.draw.rect(screen, (30, 30, 30), rect)
         state = "PLAY" if playing else "PAUSE"
-        sps_str = f"{sps/1000:.1f}k" if sps >= 1000 else f"{sps:.0f}"
-        speed_str = f"speed {speed_level:+d}"
-        txt = (f" step {step_num:>6d}  t={t:.5f}s  |  {fps_val:.0f}fps  |  "
-               f"{sps_str} steps/s  |  spf={spf}  |  {speed_str}  |  "
-               f"{backend}  |  [{state}]  |  vmax={vmax_display:.2e}  |  "
-               f"space=play  +/-=speed  R=reset  click=probe")
+        zoom_str = f"{vp.zoom_level:.1f}x" if vp.zoom_level > 1.01 else "1x"
+        # Cursor world position
+        mx, my = pygame.mouse.get_pos()
+        if mx < layout.grid_w and my < layout.grid_h:
+            cwx, cwy = vp.pixel_to_world(mx, my)
+            cursor_str = f"({cwx:.1f},{cwy:.1f})m"
+        else:
+            cursor_str = ""
+        if replay_meta:
+            n_total = replay_meta["n_frames"]
+            txt = (f" frame {step_num}/{n_total}  t={t:.5f}s  |  {fps_val:.0f}fps  |  "
+                   f"spf={spf}  |  speed {speed_level:+d}  |  "
+                   f"zoom {zoom_str}  |  {cursor_str}  |  "
+                   f"REPLAY [{state}]  |  vmax={vmax_display:.2e}")
+        else:
+            sps_str = f"{sps/1000:.1f}k" if sps >= 1000 else f"{sps:.0f}"
+            txt = (f" step {step_num:>6d}  t={t:.5f}s  |  {fps_val:.0f}fps  |  "
+                   f"{sps_str} sps  spf={spf}  speed {speed_level:+d}  |  "
+                   f"zoom {zoom_str}  |  {cursor_str}  |  "
+                   f"{backend} [{state}]  |  vmax={vmax_display:.2e}")
         surf = font.render(txt, True, HUD_FG)
         screen.blit(surf, (4, layout.grid_h + 7))
 
-    # ── Pre-compute (playback mode) ──
+    # ── Pre-compute or load frames (playback mode) ──
 
     if mode == "playback":
-        print(f"Pre-computing {sim_cfg.steps} steps...")
-        for s in range(sim_cfg.steps):
-            p = stepper.step()
-            frame_history.append(p)
-            if (s + 1) % 500 == 0:
-                print(f"  {s + 1}/{sim_cfg.steps}")
-        print("Pre-compute done. Starting playback.")
+        if preloaded_frames is not None:
+            frame_history = preloaded_frames
+            print(f"Loaded {len(frame_history)} replay frames.")
+        elif stepper is not None:
+            print(f"Pre-computing {sim_cfg.steps} steps...")
+            for s in range(sim_cfg.steps):
+                p = stepper.step()
+                frame_history.append(p)
+                if (s + 1) % 500 == 0:
+                    print(f"  {s + 1}/{sim_cfg.steps}")
+            print("Pre-compute done. Starting playback.")
         playback_idx = 0
 
     if mode == "playback" and frame_history:
@@ -663,6 +948,8 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
                         current_field = np.zeros((sim_cfg.ny, sim_cfg.nx), dtype=np.float32)
                     else:
                         playback_idx = 0
+                elif ev.key == pygame.K_HOME:
+                    vp.reset()
                 elif ev.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     speed_level = min(20, speed_level + 1)
                 elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
@@ -682,14 +969,31 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
                     if playback_idx > 0:
                         playback_idx -= 1
                         current_field = frame_history[playback_idx]
+            elif ev.type == pygame.MOUSEWHEEL:
+                mx, my = pygame.mouse.get_pos()
+                if mx < layout.grid_w and my < layout.grid_h:
+                    factor = 1.15 ** ev.y
+                    vp.zoom(factor, mx, my)
             elif ev.type == pygame.MOUSEBUTTONDOWN:
-                if ev.button == 1:
+                if ev.button == 2:  # middle click — start pan
+                    panning = True
+                    pan_last = ev.pos
+                elif ev.button == 1:
                     if not handle_click_remove(*ev.pos):
                         cell = pixel_to_cell(*ev.pos)
                         if cell:
                             add_probe(*cell)
                 elif ev.button == 3:
                     handle_click_remove(*ev.pos)
+            elif ev.type == pygame.MOUSEBUTTONUP:
+                if ev.button == 2:
+                    panning = False
+            elif ev.type == pygame.MOUSEMOTION:
+                if panning:
+                    dx = ev.pos[0] - pan_last[0]
+                    dy = ev.pos[1] - pan_last[1]
+                    vp.pan(dx, dy)
+                    pan_last = ev.pos
 
         # Advance simulation — auto-tune spf to stay within frame budget
         sim_steps_this_frame = 0
@@ -736,6 +1040,7 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
 
         # Render
         render_field(current_field)
+        render_axes()
 
         # Throttle probe plot re-renders (background thread handles the heavy work)
         probe_redraw_counter += 1
@@ -749,10 +1054,13 @@ def run_gui(sim_cfg: PressureCASimConfig, mode: str = "live"):
             t = stepper.current_time
         else:
             step_num = playback_idx
-            t = playback_idx * sim_cfg.dt
+            if replay_meta and "frame_times" in replay_meta and playback_idx < len(replay_meta["frame_times"]):
+                t = float(replay_meta["frame_times"][playback_idx])
+            else:
+                t = playback_idx * sim_cfg.dt
 
         fps_val = clock.get_fps()
-        render_hud(step_num, t, fps_val, stepper.backend_name, mode,
+        render_hud(step_num, t, fps_val, backend_label, mode,
                    steps_per_frame, steps_per_sec_smooth)
         pygame.display.flip()
         clock.tick(0)  # no cap — auto-tuning handles pacing
@@ -772,31 +1080,160 @@ def parse_args():
                     help="YAML config file (default: configs/default.yaml)")
     p.add_argument("--mode", type=str, default="live", choices=["live", "playback"],
                     help="live = compute on-the-fly, playback = pre-compute then scrub")
+    p.add_argument("--replay", type=str, default=None, metavar="EXPERIMENT_DIR",
+                    help="Replay a saved experiment (loads frames.npz + config.yaml)")
     p.add_argument("--backend", type=str, default=None, choices=["auto", "cpu", "gpu"])
     return p.parse_args()
+
+
+def _load_replay(replay_dir: Path):
+    """Load frames from an experiment directory.
+
+    Supports two storage formats:
+    - ``frames.npz`` — compressed archive with metadata (legacy / small runs)
+    - ``_frames_cache.bin`` — flat binary produced by ``_FrameSink`` disk mode
+
+    Returns (sim_cfg, frame_source, replay_meta).  *frame_source* is an
+    indexable sequence (list or ``_DiskFrameReader``).
+    """
+    cfg_path = replay_dir / "config.yaml"
+    npz_path = replay_dir / "frames.npz"
+    bin_path = replay_dir / "_frames_cache.bin"
+
+    if not cfg_path.exists():
+        print(f"ERROR: {cfg_path} not found in replay dir")
+        sys.exit(1)
+
+    cfg_dict = load_config(cfg_path)
+    sim_cfg = config_to_sim(cfg_dict)
+
+    # ── Try frames.npz first ──
+    if npz_path.exists():
+        data = np.load(npz_path)
+        frames_arr = data["frames"]
+        frame_times = data["frame_times"]
+        ds_factor = int(data["ds_factor"]) if "ds_factor" in data else 1
+        orig_nx = int(data["nx"]) if "nx" in data else sim_cfg.nx
+        orig_ny = int(data["ny"]) if "ny" in data else sim_cfg.ny
+
+        frame_list = [frames_arr[i] for i in range(frames_arr.shape[0])]
+
+        stored_ny, stored_nx = frames_arr.shape[1], frames_arr.shape[2]
+        if stored_nx != sim_cfg.nx or stored_ny != sim_cfg.ny:
+            sim_cfg = PressureCASimConfig(**{
+                **sim_cfg.__dict__,
+                "nx": stored_nx, "ny": stored_ny,
+                "dx": sim_cfg.dx * ds_factor, "dy": sim_cfg.dy * ds_factor,
+                "source_ix": sim_cfg.source_ix // ds_factor,
+                "source_iy": sim_cfg.source_iy // ds_factor,
+            })
+
+        meta = {
+            "experiment": replay_dir.name,
+            "n_frames": len(frame_list),
+            "ds_factor": ds_factor,
+            "orig_nx": orig_nx,
+            "orig_ny": orig_ny,
+            "frame_times": frame_times,
+        }
+        return sim_cfg, frame_list, meta
+
+    # ── Fall back to _frames_cache.bin ──
+    if bin_path.exists():
+        import json
+        meta_json_path = replay_dir / "_frames_cache_meta.json"
+        if meta_json_path.exists():
+            with open(meta_json_path) as f:
+                fmeta = json.load(f)
+            stored_ny = fmeta["ny"]
+            stored_nx = fmeta["nx"]
+            n_frames = fmeta["count"]
+            ds_factor = fmeta.get("ds", 1)
+        else:
+            stored_ny, stored_nx = sim_cfg.ny, sim_cfg.nx
+            ds_factor = 1
+            file_bytes = bin_path.stat().st_size
+            frame_nbytes = stored_ny * stored_nx * 4
+            n_frames = file_bytes // frame_nbytes
+
+        if n_frames == 0:
+            print(f"ERROR: {bin_path} has no usable frames")
+            sys.exit(1)
+
+        reader = _DiskFrameReader(str(bin_path), n_frames,
+                                  stored_ny, stored_nx, np.float32)
+
+        if stored_nx != sim_cfg.nx or stored_ny != sim_cfg.ny:
+            sim_cfg = PressureCASimConfig(**{
+                **sim_cfg.__dict__,
+                "nx": stored_nx, "ny": stored_ny,
+                "dx": sim_cfg.dx * ds_factor, "dy": sim_cfg.dy * ds_factor,
+                "source_ix": sim_cfg.source_ix // ds_factor,
+                "source_iy": sim_cfg.source_iy // ds_factor,
+            })
+
+        stride = max(1, sim_cfg.frame_stride)
+        frame_times = np.arange(n_frames) * sim_cfg.dt * stride
+        meta = {
+            "experiment": replay_dir.name,
+            "n_frames": n_frames,
+            "ds_factor": ds_factor,
+            "orig_nx": sim_cfg.nx * ds_factor,
+            "orig_ny": sim_cfg.ny * ds_factor,
+            "frame_times": frame_times,
+        }
+        return sim_cfg, reader, meta
+
+    print(f"ERROR: No frame data found in {replay_dir}. "
+          f"Need frames.npz or _frames_cache.bin.")
+    sys.exit(1)
 
 
 def main():
     args = parse_args()
 
-    config_path = Path(args.config) if args.config else DEFAULT_CONFIG
-    if not config_path.is_absolute():
-        config_path = PROJECT_ROOT / config_path
-    if not config_path.exists():
-        print(f"ERROR: config not found: {config_path}")
-        sys.exit(1)
+    replay_meta = None
 
-    print(f"Loading config: {config_path}")
-    cfg_dict = load_config(config_path)
-    sim_cfg = config_to_sim(cfg_dict)
+    if args.replay:
+        replay_dir = Path(args.replay)
+        if not replay_dir.is_absolute():
+            replay_dir = PROJECT_ROOT / args.replay
+        if not replay_dir.exists():
+            # Try as a subdirectory of experiments/
+            alt = PROJECT_ROOT / "experiments" / args.replay
+            if alt.exists():
+                replay_dir = alt
+            else:
+                print(f"ERROR: replay dir not found: {replay_dir}")
+                sys.exit(1)
+
+        print(f"Loading replay: {replay_dir}")
+        sim_cfg, frame_list, replay_meta = _load_replay(replay_dir)
+        mode = "playback"
+        ds = replay_meta['ds_factor']
+        ds_note = f", downsampled {ds}x" if ds > 1 else ""
+        print(f"Grid: {sim_cfg.nx}x{sim_cfg.ny} ({replay_meta['n_frames']} frames{ds_note})")
+    else:
+        config_path = Path(args.config) if args.config else DEFAULT_CONFIG
+        if not config_path.is_absolute():
+            config_path = PROJECT_ROOT / config_path
+        if not config_path.exists():
+            print(f"ERROR: config not found: {config_path}")
+            sys.exit(1)
+
+        print(f"Loading config: {config_path}")
+        cfg_dict = load_config(config_path)
+        sim_cfg = config_to_sim(cfg_dict)
+        frame_list = None
+        mode = args.mode
 
     if args.backend:
         sim_cfg = PressureCASimConfig(**{**sim_cfg.__dict__, "backend": args.backend})
 
     print(f"Grid: {sim_cfg.nx}x{sim_cfg.ny}, dx={sim_cfg.dx}, dy={sim_cfg.dy}")
-    print(f"dt={sim_cfg.dt:.6f}, steps={sim_cfg.steps}, mode={args.mode}")
+    print(f"dt={sim_cfg.dt:.6f}, steps={sim_cfg.steps}, mode={mode}")
 
-    run_gui(sim_cfg, mode=args.mode)
+    run_gui(sim_cfg, mode=mode, preloaded_frames=frame_list, replay_meta=replay_meta)
 
 
 if __name__ == "__main__":

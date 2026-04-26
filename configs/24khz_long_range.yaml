@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────────────────────
+# 24 kHz long-range: 200 m × 100 m ocean cross-section
+#
+# Uses the 4th-order spatial stencil so the grid only needs ~5 cells
+# per wavelength instead of ~10.  At 24 kHz (λ ≈ 6 cm) that gives
+# dx ≈ 12 mm, producing a grid of roughly 16 000 × 8 000 ≈ 128 M cells.
+# Fits comfortably in 12 GB VRAM (~2 GB for four f32 arrays).
+#
+# The wavefront crosses the full 200 m domain in ~0.13 s simulated
+# time, which at ~150–200 steps/sec on a modern GPU takes about 2–3
+# minutes of wall-clock time — fine for ranging checks.
+#
+# Boundaries: top is pressure-release (surface), bottom is rigid
+# (seabed), sides are open so energy leaves the domain.
+# ─────────────────────────────────────────────────────────────
+
+grid:
+  width_m: 200
+  height_m: 100
+  stencil_order: 4        # 4th-order Laplacian — fewer cells needed
+  cells_per_wavelength: 5  # 5 cpw is accurate with 4th-order stencil
+
+time:
+  dt: 0              # auto CFL-safe
+  duration: 0.3     # just enough for wavefront to cross the domain
+
+model:
+  type: wave
+  absorption: 2   # low absorption for clean ranging checks
+
+source:
+  ix: null           # center
+  iy: null           # center
+  amplitude: 1400.0
+  frequency: 24000   # 24 kHz
+
+boundary:
+  top:    -0.98      # surface (phase-inverting)
+  bottom:  0.99      # hard seabed
+  left:    0.0       # open — waves exit
+  right:   0.0       # open — waves exit
+
+ssp:
+  depths: [0, 15, 35, 60, 100]
+  speeds: [1535, 1518, 1492, 1503, 1520]
+
+backend: auto
+
+output:
+  frame_stride: 200    # ~517 MB/frame at full res; stride 1000 → ~58 frames ≈ 30 GB
+  gif_fps: 30
+  no_gif: true          # GIF generation impractical at this resolution
+  tag: 24khz_long_range
