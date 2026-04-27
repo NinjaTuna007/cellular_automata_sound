@@ -31,9 +31,10 @@ model:
   absorption: 0.05
 
 source:
-  ix: null           # centre
-  iy: null
-  iz: null
+  # Physical position in metres (null = grid centre)
+  x: 5.0             # metres from left wall
+  y: 2.5             # metres from bottom
+  z: 5.0             # metres from front wall
   amplitude: 1400.0
   frequency: 1000    # 1 kHz
 

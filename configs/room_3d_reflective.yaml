@@ -27,11 +27,12 @@ model:
   absorption: 0.02   # low absorption to let it ring
 
 source:
-  ix: null
-  iy: null
-  iz: null
+  # Physical position in metres (null = grid centre)
+  x: 3.0       # metres from left wall
+  y: 2.5       # metres from bottom
+  z: 2.0       # metres from front wall
   amplitude: 1400.0
-  frequency: 2400
+  frequency: 10000
 
 boundary:
   top:    -0.98      # surface (phase-inverting)

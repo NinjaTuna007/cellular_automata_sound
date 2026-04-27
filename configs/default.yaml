@@ -32,8 +32,10 @@ model:
 
 # ── Source ─────────────────────────────────────────────────
 source:
-  ix: null          # x-index, null → center of grid
-  iy: null          # y-index, null → center of grid
+  # Position: use x/y in metres (preferred) or ix/iy as cell indices.
+  # Physical coords (x/y) take priority.  null = grid centre.
+  x: null           # metres from left edge (null → centre)
+  y: null           # metres from top edge  (null → centre)
   amplitude: 1400.0 # Pa
   frequency: 200    # Hz — dx/dy/dt auto-resolve around this
 

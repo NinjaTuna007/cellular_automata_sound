@@ -197,8 +197,16 @@ def config_to_sim(cfg: dict, args) -> PressureCASimConfig:
 
     source_ix_raw = args.source_ix if args.source_ix is not None else get(cfg, "source", "ix", default=None)
     source_iy_raw = args.source_iy if args.source_iy is not None else get(cfg, "source", "iy", default=None)
+    src_x = get(cfg, "source", "x", default=None)
+    src_y = get(cfg, "source", "y", default=None)
+    if src_x is not None and source_ix_raw is None:
+        source_ix_raw = int(round(float(src_x) / dx))
+    if src_y is not None and source_iy_raw is None:
+        source_iy_raw = int(round(float(src_y) / dy))
     source_ix = source_ix_raw if source_ix_raw is not None else nx // 2
     source_iy = source_iy_raw if source_iy_raw is not None else ny // 2
+    source_ix = max(0, min(source_ix, nx - 1))
+    source_iy = max(0, min(source_iy, ny - 1))
     amplitude = args.source_amplitude if args.source_amplitude is not None else get(cfg, "source", "amplitude", default=1400.0)
 
     r_top = args.reflect_top if args.reflect_top is not None else get(cfg, "boundary", "top", default=-0.98)
@@ -280,12 +288,25 @@ def config_to_sim_3d(cfg: dict, args) -> WaveConfig3D:
     src_ix = args.source_ix if args.source_ix is not None else get(cfg, "source", "ix")
     src_iy = args.source_iy if args.source_iy is not None else get(cfg, "source", "iy")
     src_iz = get(cfg, "source", "iz")
+    # Physical coords (metres) take priority over cell indices
+    src_x = get(cfg, "source", "x")
+    src_y = get(cfg, "source", "y")
+    src_z = get(cfg, "source", "z")
+    if src_x is not None:
+        src_ix = int(round(float(src_x) / dx))
+    if src_y is not None:
+        src_iy = int(round(float(src_y) / dy))
+    if src_z is not None:
+        src_iz = int(round(float(src_z) / dz))
     if src_ix is None:
         src_ix = nx // 2
     if src_iy is None:
         src_iy = ny // 2
     if src_iz is None:
         src_iz = nz // 2
+    src_ix = max(0, min(src_ix, nx - 1))
+    src_iy = max(0, min(src_iy, ny - 1))
+    src_iz = max(0, min(src_iz, nz - 1))
 
     amplitude = args.source_amplitude if args.source_amplitude is not None else get(cfg, "source", "amplitude", default=500.0)
     backend = args.backend or get(cfg, "backend", default="auto")

@@ -141,10 +141,18 @@ def config_to_sim(cfg: dict) -> PressureCASimConfig:
 
     source_ix = _get(cfg, "source", "ix", default=None)
     source_iy = _get(cfg, "source", "iy", default=None)
+    src_x = _get(cfg, "source", "x", default=None)
+    src_y = _get(cfg, "source", "y", default=None)
+    if src_x is not None:
+        source_ix = int(round(float(src_x) / dx))
+    if src_y is not None:
+        source_iy = int(round(float(src_y) / dy))
     if source_ix is None:
         source_ix = nx // 2
     if source_iy is None:
         source_iy = ny // 2
+    source_ix = max(0, min(source_ix, nx - 1))
+    source_iy = max(0, min(source_iy, ny - 1))
 
     return PressureCASimConfig(
         nx=nx, ny=ny, dx=dx, dy=dy, dt=dt, steps=steps,

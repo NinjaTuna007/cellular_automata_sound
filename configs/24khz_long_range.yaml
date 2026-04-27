@@ -29,8 +29,8 @@ model:
   absorption: 2   # low absorption for clean ranging checks
 
 source:
-  ix: null           # center
-  iy: null           # center
+  x: 100.0           # metres from left edge (centre of 200 m domain)
+  y: 50.0            # metres from top (centre of 100 m domain)
   amplitude: 1400.0
   frequency: 24000   # 24 kHz
 

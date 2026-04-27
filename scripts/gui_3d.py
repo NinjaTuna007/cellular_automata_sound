@@ -120,15 +120,29 @@ def load_config_3d(path: Path) -> WaveConfig3D:
     else:
         steps = steps_raw
 
+    # Source position: prefer physical coords (x/y/z in metres), fall back
+    # to cell indices (ix/iy/iz), then default to grid centre.
     source_ix = _get(raw, "source", "ix")
     source_iy = _get(raw, "source", "iy")
     source_iz = _get(raw, "source", "iz")
+    src_x = _get(raw, "source", "x")
+    src_y = _get(raw, "source", "y")
+    src_z = _get(raw, "source", "z")
+    if src_x is not None:
+        source_ix = int(round(float(src_x) / grid["dx"]))
+    if src_y is not None:
+        source_iy = int(round(float(src_y) / grid["dy"]))
+    if src_z is not None:
+        source_iz = int(round(float(src_z) / grid["dz"]))
     if source_ix is None:
         source_ix = grid["nx"] // 2
     if source_iy is None:
         source_iy = grid["ny"] // 2
     if source_iz is None:
         source_iz = grid["nz"] // 2
+    source_ix = max(0, min(source_ix, grid["nx"] - 1))
+    source_iy = max(0, min(source_iy, grid["ny"] - 1))
+    source_iz = max(0, min(source_iz, grid["nz"] - 1))
 
     return WaveConfig3D(
         nx=grid["nx"], ny=grid["ny"], nz=grid["nz"],
@@ -294,6 +308,7 @@ class AcousticVolumeGUI:
         self.cmap_idx = 0
         self.method_idx = 0
         self.vmax = 1.0
+        self.vmax_manual = None  # None = auto-tracking, float = user-locked
 
         # Probe state
         self.probes: list[dict] = []
@@ -503,10 +518,16 @@ class AcousticVolumeGUI:
             vol = self.stepper.pressure if self.stepper else np.zeros(
                 (self.cfg.nz, self.cfg.ny, self.cfg.nx), dtype=np.float32)
 
-        # Update volume
+        # Update volume with adaptive or manual color scaling
         absmax = float(np.abs(vol).max())
-        if absmax > 1e-12:
-            self.vmax = max(self.vmax * 0.95, absmax)
+        if self.vmax_manual is not None:
+            self.vmax = self.vmax_manual
+        elif absmax > 1e-12:
+            # Fast attack, moderate decay — keeps colors punchy
+            if absmax > self.vmax:
+                self.vmax = absmax
+            else:
+                self.vmax = self.vmax * 0.8 + absmax * 0.2
         self._current_vol = vol
         self.volume.set_data(vol)
         self.volume.clim = (-self.vmax, self.vmax)
@@ -571,7 +592,8 @@ class AcousticVolumeGUI:
         method = RENDER_METHODS[self.method_idx]
         cmap = COLORMAPS[self.cmap_idx]
         spf_str = f"spf={self.spf}" if not self.is_replay else "replay"
-        vmax_str = f"vmax={self.vmax:.1e}"
+        vmax_mode = "manual" if self.vmax_manual else "auto"
+        vmax_str = f"vmax={self.vmax:.1e} ({vmax_mode})"
         slice_info = " ".join(
             f"{ax.upper()}={frac:.0%}"
             for ax, (en, frac) in self.slices.items() if en)
@@ -622,6 +644,20 @@ class AcousticVolumeGUI:
             delta = 0.02 if key == "]" else -0.02
             self.slices[ax][1] = np.clip(self.slices[ax][1] + delta, 0.0, 1.0)
             self._build_slice_planes()
+
+        elif key == "V":
+            # Boost color intensity (halve vmax)
+            self.vmax_manual = (self.vmax_manual or self.vmax) * 0.5
+            self.vmax = self.vmax_manual
+
+        elif key == "B":
+            # Dim color intensity (double vmax)
+            self.vmax_manual = (self.vmax_manual or self.vmax) * 2.0
+            self.vmax = self.vmax_manual
+
+        elif key == "A":
+            # Toggle auto color scaling
+            self.vmax_manual = None
 
         elif key == "R":
             cfg = self.cfg

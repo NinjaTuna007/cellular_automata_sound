@@ -32,8 +32,8 @@ model:
   absorption: 0.02   # low absorption — let it ring
 
 source:
-  ix: null           # center
-  iy: null           # center
+  x: 4.0             # metres from left wall (centre of 8 m tank)
+  y: 2.0             # metres from top (centre of 4 m tank)
   amplitude: 1400.0  # Pa
   frequency: 24000   # 24 kHz — dx/dy auto-resolve to ≈6 mm cells
 

@@ -24,8 +24,8 @@ model:
   absorption: 0.05
 
 source:
-  ix: null           # center of grid
-  iy: null           # center of grid
+  x: 200.0           # metres from left edge (centre of 400 m domain)
+  y: 45.0            # metres from top (centre of 90 m depth)
   amplitude: 1400.0  # Pa
   frequency: 200     # Hz — change this and dx/dy auto-adjust
 
