@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────
+# 3D Underwater Simulation — 1 kHz source in a 10m × 5m × 10m volume
+#
+# A 10×5×10 m water volume with a 1 kHz point source at the
+# centre.  Sound speed is ~1500 m/s (water), with a mild
+# depth-varying SSP.  With 4th-order stencil and 5 cpw the
+# grid is ~34×17×34 ≈ 0.02M cells — trivial for the GPU.
+#
+# Walls are reflective (rigid tank), surface is phase-inverting.
+# Front and back faces are open (non-reflective) to reduce
+# standing-wave build-up.
+#
+# Usage:
+#   python scripts/gui_3d.py --config configs/room_3d.yaml
+#   python scripts/run_experiment.py --3d --config configs/room_3d.yaml
+# ─────────────────────────────────────────────────────────────
+
+grid:
+  width_m: 10.0     # x dimension (metres)
+  height_m: 5.0     # y dimension (metres)
+  depth_m: 10.0     # z dimension (metres)
+  stencil_order: 4
+  cells_per_wavelength: 5
+
+time:
+  dt: 0              # auto CFL-safe
+  duration: 0.5      # half second — a few reflections
+
+model:
+  type: wave
+  absorption: 0.05
+
+source:
+  ix: null           # centre
+  iy: null
+  iz: null
+  amplitude: 1400.0
+  frequency: 1000    # 1 kHz
+
+boundary:
+  top:    -0.98      # surface (phase-inverting)
+  bottom:  0.99      # seabed (hard)
+  left:    0.99      # side wall
+  right:   0.99      # side wall
+  front:   0.0       # open
+  back:    0.0       # open
+
+ssp:
+  depths: [0, 2.5, 5]
+  speeds: [1520, 1510, 1518]
+
+backend: auto
+
+output:
+  frame_stride: 10
+  tag: room_3d

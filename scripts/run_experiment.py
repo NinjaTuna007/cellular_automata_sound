@@ -62,6 +62,12 @@ from pressure_transfer_ca import (
     save_gif_parallel,
 )
 
+from wave_3d import (
+    WaveConfig3D,
+    auto_resolve_grid_3d,
+    run_wave_3d,
+)
+
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "default.yaml"
 
 
@@ -106,6 +112,10 @@ def parse_args():
     over.add_argument("--no-grid", action="store_true", default=None,
                        help="Hide cell boundary grid lines")
     over.add_argument("--tag", type=str, default=None)
+    over.add_argument("--3d", dest="is_3d", action="store_true", default=False,
+                       help="Run 3D simulation (requires 3D config)")
+    over.add_argument("--depth-m", type=float, default=None,
+                       help="(3D only) domain depth in metres")
 
     return p.parse_args()
 
@@ -231,7 +241,77 @@ def config_to_sim(cfg: dict, args) -> PressureCASimConfig:
     )
 
 
-def build_experiment_dirname(sim_cfg: PressureCASimConfig, tag: str) -> str:
+def config_to_sim_3d(cfg: dict, args) -> WaveConfig3D:
+    """Build WaveConfig3D from YAML dict + CLI overrides."""
+    ssp_depths = tuple(get(cfg, "ssp", "depths", default=[0, 5]))
+    ssp_speeds = tuple(get(cfg, "ssp", "speeds", default=[1500, 1500]))
+    freq = args.freq_hz if args.freq_hz is not None else get(cfg, "source", "frequency", default=1000)
+    stencil_order = get(cfg, "grid", "stencil_order", default=2)
+
+    grid = auto_resolve_grid_3d(
+        frequency_hz=freq,
+        c_min=min(ssp_speeds), c_max=max(ssp_speeds),
+        width_m=get(cfg, "grid", "width_m"),
+        height_m=get(cfg, "grid", "height_m"),
+        depth_m=args.depth_m or get(cfg, "grid", "depth_m"),
+        dx=args.dx or get(cfg, "grid", "dx", default=0),
+        dy=args.dy or get(cfg, "grid", "dy", default=0),
+        dz=get(cfg, "grid", "dz", default=0),
+        dt=args.dt if args.dt is not None else get(cfg, "time", "dt", default=0),
+        nx=args.nx or get(cfg, "grid", "nx", default=0),
+        ny=args.ny or get(cfg, "grid", "ny", default=0),
+        nz=get(cfg, "grid", "nz", default=0),
+        cells_per_wavelength=get(cfg, "grid", "cells_per_wavelength", default=0),
+        stencil_order=stencil_order,
+    )
+    nx, ny, nz = grid["nx"], grid["ny"], grid["nz"]
+    dx, dy, dz, dt_val = grid["dx"], grid["dy"], grid["dz"], grid["dt"]
+
+    steps_raw = args.steps if args.steps is not None else get(cfg, "time", "steps", default=100000)
+    duration = get(cfg, "time", "duration", default=0)
+    if args.duration is not None:
+        duration = args.duration
+    if duration and duration > 0:
+        steps = max(1, int(round(duration / dt_val)))
+    else:
+        steps = steps_raw
+
+    absorption = args.absorption if args.absorption is not None else get(cfg, "model", "absorption", default=0.05)
+    src_ix = args.source_ix if args.source_ix is not None else get(cfg, "source", "ix")
+    src_iy = args.source_iy if args.source_iy is not None else get(cfg, "source", "iy")
+    src_iz = get(cfg, "source", "iz")
+    if src_ix is None:
+        src_ix = nx // 2
+    if src_iy is None:
+        src_iy = ny // 2
+    if src_iz is None:
+        src_iz = nz // 2
+
+    amplitude = args.source_amplitude if args.source_amplitude is not None else get(cfg, "source", "amplitude", default=500.0)
+    backend = args.backend or get(cfg, "backend", default="auto")
+    frame_stride = args.frame_stride if args.frame_stride is not None else get(cfg, "output", "frame_stride", default=5)
+
+    return WaveConfig3D(
+        nx=nx, ny=ny, nz=nz, dx=dx, dy=dy, dz=dz, dt=dt_val, steps=steps,
+        ssp_depths_m=ssp_depths, ssp_speeds_mps=ssp_speeds,
+        wave_absorption_per_s=absorption,
+        boundary_reflect_top=args.reflect_top if args.reflect_top is not None else get(cfg, "boundary", "top", default=-0.98),
+        boundary_reflect_bottom=args.reflect_bottom if args.reflect_bottom is not None else get(cfg, "boundary", "bottom", default=0.99),
+        boundary_reflect_left=args.reflect_left if args.reflect_left is not None else get(cfg, "boundary", "left", default=0.99),
+        boundary_reflect_right=args.reflect_right if args.reflect_right is not None else get(cfg, "boundary", "right", default=0.99),
+        boundary_reflect_front=get(cfg, "boundary", "front", default=0.0),
+        boundary_reflect_back=get(cfg, "boundary", "back", default=0.0),
+        stencil_order=stencil_order,
+        backend=backend,
+        use_float32=get(cfg, "use_float32", default=True),
+        source_ix=src_ix, source_iy=src_iy, source_iz=src_iz,
+        source_amplitude_pa=amplitude,
+        source_frequency_hz=freq,
+        frame_stride=frame_stride,
+    )
+
+
+def build_experiment_dirname(sim_cfg, tag: str) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if tag:
         return f"{ts}_{tag}"
@@ -282,6 +362,86 @@ def _save_frames(frames_raw: list, sim_cfg: PressureCASimConfig, exp_dir: Path):
     print(f"Saved          : {npz_path.name} ({len(frames_arr)} frames, {mb:.1f} MB)")
 
 
+def _run_3d_experiment(args, cfg, config_path):
+    """Run a 3D simulation experiment."""
+    sim_cfg = config_to_sim_3d(cfg, args)
+    tag = args.tag if args.tag is not None else get(cfg, "output", "tag", default="")
+
+    dirname = build_experiment_dirname(sim_cfg, tag)
+    exp_dir = PROJECT_ROOT / "experiments" / dirname
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(config_path, exp_dir / "config.yaml")
+
+    total_cells = sim_cfg.nx * sim_cfg.ny * sim_cfg.nz
+    print(f"Experiment dir : {exp_dir}")
+    print(f"3D Grid        : {sim_cfg.nx}x{sim_cfg.ny}x{sim_cfg.nz} = "
+          f"{total_cells / 1e6:.2f}M cells")
+    print(f"Cell size      : dx={sim_cfg.dx:.4f} dy={sim_cfg.dy:.4f} dz={sim_cfg.dz:.4f}")
+    print(f"Time           : dt={sim_cfg.dt:.6e} s, {sim_cfg.steps} steps, "
+          f"total={sim_cfg.steps * sim_cfg.dt:.4f} s")
+    print(f"Source         : ({sim_cfg.source_ix}, {sim_cfg.source_iy}, {sim_cfg.source_iz}), "
+          f"freq={sim_cfg.source_frequency_hz} Hz")
+    print(f"Boundaries     : top={sim_cfg.boundary_reflect_top}, "
+          f"bot={sim_cfg.boundary_reflect_bottom}, "
+          f"L={sim_cfg.boundary_reflect_left}, R={sim_cfg.boundary_reflect_right}, "
+          f"F={sim_cfg.boundary_reflect_front}, B={sim_cfg.boundary_reflect_back}")
+
+    n_frames_est = sim_cfg.steps // max(1, sim_cfg.frame_stride) + 1
+    print(f"Frames         : ~{n_frames_est} (stride {sim_cfg.frame_stride})")
+
+    print("Running 3D simulation...")
+    pbar = tqdm(total=sim_cfg.steps, unit="step", dynamic_ncols=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+
+    def _tqdm_progress(step: int, total: int):
+        pbar.update(step - pbar.n)
+
+    t0 = _time.monotonic()
+    result = run_wave_3d(sim_cfg, progress_fn=_tqdm_progress,
+                         frame_dir=str(exp_dir))
+    elapsed = _time.monotonic() - t0
+    pbar.close()
+    backend_used = result.get("backend_used", "unknown")
+    print(f"Backend        : {backend_used}")
+    print(f"Wall time      : {elapsed:.1f} s "
+          f"({sim_cfg.steps / max(0.01, elapsed):.0f} steps/s)")
+
+    no_frames = args.no_frames if args.no_frames else get(cfg, "output", "no_frames", default=False)
+    sink = result.get("_frame_sink")
+
+    if no_frames:
+        if sink is not None:
+            sink.cleanup()
+    elif sink is not None:
+        if sink._mode == "ram":
+            frames = result.get("frames", [])
+            if frames and len(frames) > 0:
+                frame_times = np.arange(len(frames)) * sim_cfg.dt * max(1, sim_cfg.frame_stride)
+                npz_path = exp_dir / "frames.npz"
+                frame_arr = np.array([np.asarray(f) for f in frames], dtype=np.float32)
+                np.savez_compressed(
+                    npz_path, frames=frame_arr, frame_times=frame_times,
+                    dt=sim_cfg.dt, frame_stride=sim_cfg.frame_stride,
+                    nx=sim_cfg.nx, ny=sim_cfg.ny, nz=sim_cfg.nz,
+                    dx=sim_cfg.dx, dy=sim_cfg.dy, dz=sim_cfg.dz,
+                    source_ix=sim_cfg.source_ix, source_iy=sim_cfg.source_iy,
+                    source_iz=sim_cfg.source_iz,
+                    source_frequency_hz=sim_cfg.source_frequency_hz,
+                    stencil_order=sim_cfg.stencil_order,
+                )
+                mb = npz_path.stat().st_size / (1024 * 1024)
+                print(f"Saved          : {npz_path.name} ({len(frames)} frames, {mb:.1f} MB)")
+            sink.cleanup()
+        else:
+            # Disk-backed: keep cache files for gui_3d replay
+            if sink._fh and not sink._fh.closed:
+                sink._fh.close()
+            cache_mb = (sink.count * sink._frame_nbytes) / (1024 * 1024)
+            print(f"Replay data    : {sink.count} frames in {sink.disk_path} ({cache_mb:.0f} MB)")
+
+    print(f"\nDone. Results in:\n  {exp_dir}")
+
+
 def main():
     args = parse_args()
 
@@ -295,6 +455,12 @@ def main():
     print(f"Loading config: {config_path}")
     cfg = load_config(config_path)
 
+    # ── 3D mode ──
+    if args.is_3d:
+        _run_3d_experiment(args, cfg, config_path)
+        return
+
+    # ── 2D mode (existing) ──
     sim_cfg = config_to_sim(cfg, args)
 
     no_gif = args.no_gif if args.no_gif else get(cfg, "output", "no_gif", default=False)

@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────
+# 3D Fully-Reflective Tank — standing wave patterns
+#
+# 5m × 3m × 5m water tank with all walls reflective.
+# Source at 500 Hz gives wavelengths of ~3 m in water.
+# Interference patterns build up as sound bounces around
+# the enclosed volume.
+#
+# Usage:
+#   python scripts/gui_3d.py --config configs/room_3d_reflective.yaml
+#   python scripts/run_experiment.py --3d --config configs/room_3d_reflective.yaml
+# ─────────────────────────────────────────────────────────────
+
+grid:
+  width_m: 6.0
+  height_m: 5.0
+  depth_m: 4.0
+  stencil_order: 4
+  cells_per_wavelength: 5
+
+time:
+  dt: 0
+  duration: 1.0
+
+model:
+  type: wave
+  absorption: 0.02   # low absorption to let it ring
+
+source:
+  ix: null
+  iy: null
+  iz: null
+  amplitude: 1400.0
+  frequency: 2400
+
+boundary:
+  top:    -0.98      # surface (phase-inverting)
+  bottom:  0.99      # seabed
+  left:    0.99      # rigid wall
+  right:   0.99      # rigid wall
+  front:   0.99      # rigid wall
+  back:    0.99      # rigid wall
+
+ssp:
+  depths: [0, 1.5, 3]
+  speeds: [1515, 1505, 1512]
+
+backend: auto
+
+output:
+  frame_stride: 5
+  tag: room_3d_reflective
